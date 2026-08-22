@@ -739,7 +739,6 @@ export function WebGPURetina({
           entries: [
             { binding: 0, resource: { buffer: nodeBuffers[sourceIndex] } },
             { binding: 1, resource: { buffer: nodeBuffers[1 - sourceIndex] } },
-            { binding: 2, resource: { buffer: simulationUniform } },
           ],
         }),
       }));
