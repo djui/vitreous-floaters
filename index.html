@@ -1,17 +1,1321 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#6d0710" />
-    <meta
-      name="description"
-      content="An interactive WebGPU simulation of retinal scintillation and drifting vitreous floaters."
-    />
-    <title>Vitreous Floaters</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#140503">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Vitreous Floaters">
+<meta property="og:description" content="What you see with your eyes closed, facing a bright summer sun: vitreous floaters simulated from the physics up, in one HTML file.">
+<meta property="og:url" content="https://djui.github.io/vitreous-floaters/">
+<meta property="og:image" content="https://djui.github.io/vitreous-floaters/docs/screenshot.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23ef8f42'/%3E%3Cpath d='M16 41c7-11 14-1 21-12s11-7 11-7' fill='none' stroke='%237a2a0c' stroke-width='3' stroke-linecap='round' opacity='.65'/%3E%3Ccircle cx='24' cy='22' r='5.5' fill='none' stroke='%237a2a0c' stroke-width='2.5' opacity='.55'/%3E%3C/svg%3E">
+<title>Vitreous Floaters</title>
+<meta name="description" content="A physics-based simulation of vitreous floaters seen with the eyes closed, facing a bright summer sun.">
+<style>
+  /* One committed look: the inside of a sunlit eyelid. Same palette in every theme. */
+  :root {
+    --ground: #140503;
+    --ink: #ffece0;
+    --ink-dim: rgba(255, 230, 212, 0.66);
+    --line: rgba(255, 214, 190, 0.45);
+    --accent: #ffb46e;
+    --panel: rgba(16, 5, 3, 0.86);
+    color-scheme: dark;
+  }
+  html, body { height: 100%; margin: 0; background: var(--ground); overflow: hidden; }
+  body { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
+  canvas { position: fixed; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+  #view { cursor: none; outline: none; }
+  #view.cursor { cursor: default; }
+  #overlay { pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="view" tabindex="0" role="img" aria-label="Simulated view of one eye, closed and facing the sun: a warm red-orange glow crossed by the soft shadows of vitreous floaters. Move the pointer to move the eye, scroll to squeeze the eyelids, press D for a cross-section of the eye."></canvas>
+<canvas id="overlay" aria-hidden="true"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   Floaters behind closed eyelids — a physically based entoptic simulation
+   Units: millimetres, seconds, radians (degrees only for gaze & screen).
+   Eye frame: origin at the eye's centre of rotation, +z anterior (out of
+   the cornea), +x subject's right, +y up.  Simulated eye: the right eye.
+   ===================================================================== */
+
+// ---------- small math ----------
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const DEG = Math.PI / 180;
+const sq = x => x * x;
+function erf(x) {
+  const s = x < 0 ? -1 : 1; x = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * x);
+  const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return s * y;
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function gauss(rng) { let u = 0; while (u === 0) u = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng()); }
+const noiseRng = mulberry32(90210);
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const scl = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const len3 = a => Math.hypot(a[0], a[1], a[2]);
+const nrm = a => scl(a, 1 / len3(a));
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+// rotations in this file's convention: rotY(+) turns +z toward +x, rotX(+) turns +z toward +y
+const rotY = (p, a) => { const c = Math.cos(a), s = Math.sin(a); return [p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c]; };
+const rotX = (p, a) => { const c = Math.cos(a), s = Math.sin(a); return [p[0], p[1] * c + p[2] * s, -p[1] * s + p[2] * c]; };
+function inv3(m) { // row-major 3x3
+  const [a, b, c, d, e, f, g, h, i] = m;
+  const A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+  const det = a * A + b * B + c * C;
+  return [A / det, -(b * i - c * h) / det, (b * f - c * e) / det,
+          B / det, (a * i - c * g) / det, -(a * f - c * d) / det,
+          C / det, -(a * h - b * g) / det, (a * e - b * d) / det];
+}
+const mul3 = (m, n) => { const r = new Array(9); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) r[i * 3 + j] = m[i * 3] * n[j] + m[i * 3 + 1] * n[3 + j] + m[i * 3 + 2] * n[6 + j]; return r; };
+const apply3 = (m, v) => [m[0] * v[0] + m[1] * v[1] + m[2] * v[2], m[3] * v[0] + m[4] * v[1] + m[5] * v[2], m[6] * v[0] + m[7] * v[1] + m[8] * v[2]];
+
+// ---------- schematic eye (Gullstrand-like distances, simplified) ----------
+const EYE = {
+  Cv: [0, 0, 0.5],   // centre of the vitreous cavity
+  Rv: 11.0,          // cavity radius = retina; posterior pole at z = -10.5
+  zLens: 5.9,        // back of the crystalline lens: vitreous lies behind this
+  E: [0, 0, 9.8],    // exit pupil centre: rays in the vitreous converge from here
+  N: [0, 0, 6.2],    // posterior nodal point, 16.7 mm in front of the fovea
+  zEnt: 10.5,        // entrance pupil, 3 mm behind the corneal apex
+  Rlid: 14.2,        // inner surface of the closed lid, about the rotation centre
+  lamMed: 650e-6 / 1.336,               // effective wavelength inside the vitreous (mm)
+  k: 2 * Math.PI * 1.336 / 650e-6,      // wavenumber in the vitreous (1/mm)
+};
+EYE.L = EYE.E[2] - (EYE.Cv[2] - EYE.Rv); // exit pupil → fovea, 20.3 mm
+
+// ---------- spectral optics: sun → eyelid → ocular media → cones ----------
+// Prahl's molar extinction of oxy- / deoxy-haemoglobin (cm^-1 / M), 400–730 nm in 10 nm steps
+const HB_O = [266232,466840,480360,214120,102580,62816,44480,33209.2,26629.2,23684.4,20932.8,20035.2,24202.4,39956.8,53236,43016,32613.2,44496,50104,14400.8,3200,1506,942,610,442,368,319.6,294,277.6,276,290,314,348,390];
+const HB_D = [223296,303956,407560,528600,413280,103292,23388.8,16156.4,14550,16684,20035.2,25773.6,31589.6,39036.4,46592,53412,53788,45072,37020,28324.4,14677.2,9443.6,6509.6,5148.8,4345.2,3750.12,3226.56,2795.12,2407.92,2051.96,1794.28,1540.48,1325.88,1102.2];
+const HPE = [0.4002, 0.7076, -0.0808, -0.2263, 1.1653, 0.0457, 0, 0, 0.9182];   // XYZ → LMS (D65 → 1,1,1)
+const HPE_INV = inv3(HPE);
+const XYZ2RGB = [3.2406, -1.5372, -0.4986, -0.9689, 1.8758, 0.0415, 0.0557, -0.2040, 1.0570];
+const LMS2RGB = mul3(XYZ2RGB, HPE_INV);
+const lumOf = lms => HPE_INV[3] * lms[0] + HPE_INV[4] * lms[1] + HPE_INV[5] * lms[2];
+
+const SPEC = (() => {
+  const wl = []; for (let l = 400; l <= 730; l += 5) wl.push(l);
+  const g = (x, mu, s1, s2) => { const t = (x - mu) / (x < mu ? s1 : s2); return Math.exp(-0.5 * t * t); };
+  // CIE 1931 2° observer, multi-lobe fit (Wyman, Sloan & Shirley 2013)
+  const cmf = wl.map(l => [
+    1.056 * g(l, 599.8, 37.9, 31.0) + 0.362 * g(l, 442.0, 16.0, 26.7) - 0.065 * g(l, 501.1, 20.4, 26.2),
+    0.821 * g(l, 568.8, 46.9, 40.5) + 0.286 * g(l, 530.9, 16.3, 31.1),
+    1.217 * g(l, 437.0, 11.8, 36.0) + 0.681 * g(l, 459.0, 26.0, 13.8)]);
+  const planck = l => { const m = l * 1e-9; return 1 / (Math.pow(m, 5) * (Math.exp(1.4388e-2 / (m * 5600)) - 1)); };
+  const p0 = planck(560);
+  const sun = wl.map(l => planck(l) / p0);                                       // sun + sky ≈ 5600 K
+  const media = wl.map(l => Math.pow(10, -(1.1 * Math.exp(-(l - 400) / 26) + 0.015))); // cornea + lens
+  const hb = (arr, l) => { const f = (l - 400) / 10, i = Math.min(32, Math.floor(f)), t = f - i; return arr[i] * (1 - t) + arr[i + 1] * t; };
+  const cHb = 150 / 64500;                                                        // mol/L haemoglobin in blood
+  // Diffusion theory: effective attenuation of eyelid tissue, mu_eff = sqrt(3 mua (mua + mus'))
+  const muEff = wl.map(l => {
+    const eps = 0.85 * hb(HB_O, l) + 0.15 * hb(HB_D, l);                         // capillary-venous mix, SO2 85%
+    const muaBlood = 2.303 * eps * cHb / 10;                                      // 1/mm
+    const muaMel = 6.6e10 * Math.pow(l, -3.33);                                   // inside melanosomes, 1/mm
+    const muaBase = (0.0244 + 8.53 * Math.exp(-(l - 154) / 66.2)) / 10;          // bloodless tissue
+    const mua = 0.03 * muaBlood + 0.0015 * muaMel + muaBase;                      // 3% blood, thin epidermis
+    const musp = 2.4 * Math.pow(l / 500, -1.3);                                   // reduced scattering, 1/mm
+    return Math.sqrt(3 * mua * (mua + musp));
+  });
+  const LID_MM = 0.9, T_PRE = 0.13;                                               // lid thickness, boundary losses
+  const lidT = (i, m) => T_PRE * Math.exp(-muEff[i] * LID_MM * m);
+  function lmsFor(m) {
+    let X = 0, Y = 0, Z = 0;
+    for (let i = 0; i < wl.length; i++) {
+      const p = sun[i] * lidT(i, m) * media[i];
+      X += p * cmf[i][0]; Y += p * cmf[i][1]; Z += p * cmf[i][2];
+    }
+    return apply3(HPE, [X, Y, Z]);
+  }
+  // Look-up table over lid optical thickness m (1 = gently closed lid)
+  const N = 64, M0 = 0.5, M1 = 9.0;
+  const log0 = Math.log(M0), logK = (N - 1) / (Math.log(M1) - log0);
+  const ref = lumOf(lmsFor(1));
+  const lut = new Float32Array(N * 3);
+  for (let j = 0; j < N; j++) {
+    const m = Math.exp(log0 + j / logK);
+    const c = lmsFor(m);
+    lut[j * 3] = c[0] / ref; lut[j * 3 + 1] = c[1] / ref; lut[j * 3 + 2] = c[2] / ref;
+  }
+  function lutAt(m) {
+    const f = clamp((Math.log(m) - log0) * logK, 0, N - 1.001), i = Math.floor(f), t = f - i;
+    return [lerp(lut[i * 3], lut[i * 3 + 3], t), lerp(lut[i * 3 + 1], lut[i * 3 + 4], t), lerp(lut[i * 3 + 2], lut[i * 3 + 5], t)];
+  }
+  // transmitted spectrum reaching the retina, for the explainer chart
+  function spectrum(m) { return wl.map((l, i) => sun[i] * lidT(i, m) * media[i]); }
+  function transAt(l, m) { const i = Math.round((l - 400) / 5); return lidT(i, m); }
+  return { wl, lut, lutAt, log0, logK, N, spectrum, transAt };
+})();
+
+// ---------- scene: posture, sun ----------
+const SCENE = { recline: 10 * DEG, sunUp: 22 * DEG, sunRight: 8 * DEG };   // sitting, face tipped up toward the sun
+const UP_HEAD = [0, Math.cos(SCENE.recline), Math.sin(SCENE.recline)];
+const G_HEAD = scl(UP_HEAD, -1);
+function sunDirHead(t) {
+  const breath = 0.35 * DEG * Math.sin(2 * Math.PI * t / 4.2);            // head rises and falls with breathing
+  return nrm(rotY(rotX([0, 0, 1], SCENE.sunUp + breath), SCENE.sunRight));
+}
+function eyeMatrix(yaw, pitch) {   // eye → head, row-major (Fick: yaw then pitch)
+  const c0 = rotY(rotX([1, 0, 0], pitch), yaw), c1 = rotY(rotX([0, 1, 0], pitch), yaw), c2 = rotY(rotX([0, 0, 1], pitch), yaw);
+  return [c0[0], c1[0], c2[0], c0[1], c1[1], c2[1], c0[2], c1[2], c2[2]];
+}
+const colMajor = m => [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
+const dirFromView = (vx, vy) => {   // visual-field angle (deg, equidistant) → unit direction in the eye frame
+  const e = Math.hypot(vx, vy) * DEG, az = Math.atan2(vy, vx);
+  return [Math.sin(e) * Math.cos(az), Math.sin(e) * Math.sin(az), Math.cos(e)];
+};
+
+// ---------- eyelid: optical thickness map (head-fixed, mm on the lid) — mirrored in the shader ----------
+function lidThick(x, y, s, ym) {
+  let t = 1;
+  t += 0.85 * Math.exp(-sq((y - ym) / 1.35));                     // lid margins meet: tarsal edges, lash roots
+  t += 0.55 * smooth(5, 9.5, y);                                   // above the tarsus: muscle, septum, fat
+  t += 0.30 * (1 - smooth(ym - 6.5, ym - 1.5, y));                 // lower lid → cheek
+  t += 0.45 * smooth(7, 12, Math.abs(x + 0.8));                    // canthi
+  const f = Math.exp(-sq((y - 3.1 - 0.4 * Math.sin(x * 0.35 + 1)) / 0.75))
+          + 0.8 * Math.exp(-sq((y - 6.0 - 0.5 * Math.sin(x * 0.27 - 0.6)) / 0.85))
+          + 0.7 * Math.exp(-sq((y - ym + 2.3 - 0.3 * Math.sin(x * 0.4)) / 0.65));
+  return t + s * s * 0.75 * f;                                     // skin folds bunch up when squeezing
+}
+// retinal LMS for a visual direction u (eye frame), ignoring floaters
+function lidLight(u, L, area) {
+  const Q = L.Q, uh = apply3(Q, u), pe = apply3(Q, [0, 0, EYE.zEnt]);
+  const b = dot(pe, uh), c = dot(pe, pe) - EYE.Rlid * EYE.Rlid, t = -b + Math.sqrt(b * b - c);
+  const X = add(pe, scl(uh, t)), n = scl(X, 1 / EYE.Rlid);
+  const brow = 1 - smooth(10.2, 13, X[1] + (17 - X[2]) * L.sunTan);
+  const E = (0.84 * Math.max(dot(n, L.sun), 0) * brow + 0.16 * (0.55 + 0.45 * dot(n, UP_HEAD))) * L.shade;
+  const F = 1 + L.beta * Math.exp(2.2 * (dot(uh, L.sun) - 1));
+  const c3 = SPEC.lutAt(L.ms * lidThick(X[0], X[1], L.s, L.ym));
+  const k = E * F * area * (0.35 + 0.65 * u[2]);
+  return [c3[0] * k + L.veil[0], c3[1] * k + L.veil[1], c3[2] * k + L.veil[2]];
+}
+
+// ---------- physiological state ----------
+const SIM = { t: 0 };
+const LID = { level: 0.1, hold: 0, s: 0.1, touchedAt: -10 };
+const HEART = { phase: 0, pulse: 0, bpm: 64 };
+const PUPIL = { d: 3.3, drive: 3.3, hip: 0 };
+const ADAPT = { fast: [5, 5, 5], slow: [5, 5, 5] };       // starts light-adapted to open-eyed daylight
+const GAZE = { target: [0, 0], minAmp: 0.7, sacPos: [0, 0], sac: null, lastEnd: -1, refract: 0.2, drift: [0, 0], bell: 0, yaw: 0, pitch: 0 };
+const pupilArea = p => (Math.PI / 0.05) * (1 - Math.exp(-0.05 * p * p / 4));   // Stiles–Crawford weighted
+const AREA_REF = pupilArea(3.3);
+
+function stepLid(dt) {
+  const target = Math.max(LID.level, LID.hold ? 1 : 0);
+  LID.s += (target - LID.s) * (1 - Math.exp(-dt / (target > LID.s ? 0.09 : 0.24)));
+}
+function stepHeart(dt) {
+  HEART.phase = (HEART.phase + dt * HEART.bpm / 60) % 1;
+  const x = HEART.phase;
+  HEART.pulse = Math.exp(-sq((x - 0.14) / 0.07)) + 0.35 * Math.exp(-sq((x - 0.42) / 0.09));
+}
+// Saccades: main-sequence duration, minimum-jerk profile, undershoot + corrective saccade
+function planSaccade(t) {
+  if (GAZE.sac || t - GAZE.lastEnd < GAZE.refract) return;
+  const ex = GAZE.target[0] - GAZE.sacPos[0], ey = GAZE.target[1] - GAZE.sacPos[1], A = Math.hypot(ex, ey);
+  if (A < GAZE.minAmp) return;
+  const gain = A > 6 ? 0.88 + 0.07 * noiseRng() : 1;
+  GAZE.sac = { t0: t, D: (21 + 2.2 * A * gain) / 1000, from: GAZE.sacPos.slice(), to: [GAZE.sacPos[0] + ex * gain, GAZE.sacPos[1] + ey * gain] };
+}
+function advanceSaccade(t) {
+  const s = GAZE.sac; if (!s) return;
+  const u = clamp((t - s.t0) / s.D, 0, 1), p = u * u * u * (10 - 15 * u + 6 * u * u);
+  GAZE.sacPos[0] = lerp(s.from[0], s.to[0], p); GAZE.sacPos[1] = lerp(s.from[1], s.to[1], p);
+  if (u >= 1) { GAZE.sac = null; GAZE.lastEnd = t; GAZE.refract = 0.13 + 0.1 * noiseRng(); }
+}
+
+// ---------- vitreous gel: torsional Kelvin–Voigt sphere ----------
+// Each spherical shell turns rigidly by chi(r,t):  chi_tt = (c² + nu ∂t) · r⁻⁴ ∂r(r⁴ ∂r chi),
+// no-slip at r = Rv (the eye wall).  c = shear-wave speed sqrt(G/rho), nu = eta/rho.
+// G ≈ 0.63 Pa, eta ≈ 0.06 Pa·s: a partly liquefied adult vitreous → first mode ≈ 1.6 Hz, ζ ≈ 0.5.
+const NR = 28, DR = EYE.Rv / NR;
+const VIT = { c2: 25 * 25, nu: 60, chi: [new Float64Array(NR), new Float64Array(NR)], vel: [new Float64Array(NR), new Float64Array(NR)], wall: [0, 0], wallVel: [0, 0] };
+const rN = new Float64Array(NR), r4 = new Float64Array(NR), Fm = new Float64Array(NR), Fp = new Float64Array(NR);
+for (let i = 0; i < NR; i++) {
+  rN[i] = (i + 0.5) * DR; r4[i] = rN[i] ** 4;
+  Fm[i] = i > 0 ? (i * DR) ** 4 : 0;
+  Fp[i] = i < NR - 1 ? ((i + 1) * DR) ** 4 : 2 * EYE.Rv ** 4;   // last face: half a cell to the wall
+}
+const TA = new Float64Array(NR), TB = new Float64Array(NR), TC = new Float64Array(NR), TD = new Float64Array(NR), CP = new Float64Array(NR), DP = new Float64Array(NR);
+function pdeStep(k, wall, wallVel, h) {
+  const chi = VIT.chi[k], vel = VIT.vel[k], inv = 1 / (DR * DR);
+  for (let i = 0; i < NR; i++) {
+    const w = inv / r4[i];
+    const cN = i < NR - 1 ? chi[i + 1] : wall, cP = i > 0 ? chi[i - 1] : 0;
+    const lap = w * (Fp[i] * (cN - chi[i]) - Fm[i] * (chi[i] - cP));
+    const am = h * VIT.nu * w * Fm[i], ap = h * VIT.nu * w * Fp[i];
+    TA[i] = -am; TB[i] = 1 + am + ap; TC[i] = -ap;
+    TD[i] = vel[i] + h * VIT.c2 * lap;                       // elastic part explicit, viscous part implicit
+    if (i === NR - 1) { TD[i] += ap * wallVel; TC[i] = 0; }
+  }
+  CP[0] = TC[0] / TB[0]; DP[0] = TD[0] / TB[0];
+  for (let i = 1; i < NR; i++) { const m = TB[i] - TA[i] * CP[i - 1]; CP[i] = TC[i] / m; DP[i] = (TD[i] - TA[i] * DP[i - 1]) / m; }
+  vel[NR - 1] = DP[NR - 1];
+  for (let i = NR - 2; i >= 0; i--) vel[i] = DP[i] - CP[i] * vel[i + 1];
+  for (let i = 0; i < NR; i++) chi[i] += h * vel[i];
+}
+function fieldAt(arr, wallV, r) {
+  const f = r / DR - 0.5;
+  if (f <= 0) return arr[0];
+  if (f >= NR - 1) { const t = clamp((r - rN[NR - 1]) / (EYE.Rv - rN[NR - 1]), 0, 1); return arr[NR - 1] * (1 - t) + wallV * t; }
+  const i = Math.floor(f), t = f - i; return arr[i] * (1 - t) + arr[i + 1] * t;
+}
+const chiAt = (k, r) => fieldAt(VIT.chi[k], VIT.wall[k], r);
+const velAt = (k, r) => fieldAt(VIT.vel[k], VIT.wallVel[k], r);
+
+// ---------- floaters: clouds of small scatterers / phase objects in the gel ----------
+const MAXB = 20000;
+const B = { n: 0, x: new Float32Array(MAXB), y: new Float32Array(MAXB), z: new Float32Array(MAXB),
+  sig: new Float32Array(MAXB), alpha: new Float32Array(MAXB), phase: new Float32Array(MAXB),
+  cx: new Float32Array(MAXB), cy: new Float32Array(MAXB), cz: new Float32Array(MAXB) };
+let FL = [];
+function addBlob(p, sig, alpha, phase) {
+  if (B.n >= MAXB) return;
+  const i = B.n++;
+  B.x[i] = p[0]; B.y[i] = p[1]; B.z[i] = p[2]; B.sig[i] = sig; B.alpha[i] = alpha; B.phase[i] = phase;
+}
+// w: stiffness of its tether to the surrounding gel (rad/s), tau: drag time in its liquid pocket (s),
+// rise: buoyant drift speed in the liquefied vitreous (mm/s), reach: how far its tether lets it drift (mm)
+function openFloater(kind, w, tau, rise, reach) {
+  const f = { kind, i0: B.n, i1: B.n, rc: 0, c: [0, 0, 0], w, tau, rise, reach, phi: [0, 0], phiV: [0, 0], e: [0, 0, 0], conv: [0, 0, 0] };
+  FL.push(f); return f;
+}
+function closeFloater(f) {
+  f.i1 = B.n; let r = 0; const c = [0, 0, 0];
+  for (let j = f.i0; j < f.i1; j++) {
+    r += Math.hypot(B.x[j] - EYE.Cv[0], B.y[j] - EYE.Cv[1], B.z[j] - EYE.Cv[2]);
+    c[0] += B.x[j]; c[1] += B.y[j]; c[2] += B.z[j];
+  }
+  const n = Math.max(1, f.i1 - f.i0);
+  f.rc = r / n; f.c = scl(c, 1 / n);
+  for (let k = 0; k < 2; k++) { f.phi[k] = chiAt(k, f.rc); f.phiV[k] = velAt(k, f.rc); }
+}
+function retinaPointFor(vx, vy) {   // where the chief ray for a visual direction lands on the retina
+  const u = dirFromView(vx, vy), o = sub(EYE.N, EYE.Cv), dir = scl(u, -1);
+  const b = dot(o, dir), c = dot(o, o) - EYE.Rv * EYE.Rv;
+  return add(EYE.N, scl(dir, -b + Math.sqrt(b * b - c)));
+}
+function anchor(vx, vy, d) {        // a spot d mm in front of the retina whose shadow falls at (vx, vy)
+  const H = retinaPointFor(vx, vy), n = nrm(sub(EYE.E, H));
+  const t1 = nrm(cross([0, 1, 0], n)), t2 = cross(n, t1);
+  return { P: add(H, scl(n, d)), n, t1, t2, d };
+}
+const at = (A, x, y, z) => [A.P[0] + A.t1[0] * x + A.t2[0] * y + A.n[0] * z, A.P[1] + A.t1[1] * x + A.t2[1] * y + A.n[1] * z, A.P[2] + A.t1[2] * x + A.t2[2] * y + A.n[2] * z];
+const spacingFor = d => clamp(0.35 * 0.5 * 2.4 * d / (EYE.L - d), 0.006, 0.03);
+function wanderCurve(rng, length, step, kSig, corr, th0, x0 = 0, y0 = 0) {
+  const pts = []; let x = x0, y = y0, th = th0, k = 0;
+  const n = Math.max(2, Math.round(length / step)), a = Math.exp(-step / corr), bk = kSig * Math.sqrt(1 - a * a);
+  for (let i = 0; i <= n; i++) {
+    pts.push([x, y, th]);
+    k = a * k + bk * gauss(rng); th += k * step; x += Math.cos(th) * step; y += Math.sin(th) * step;
+  }
+  return pts;
+}
+function centerCurve(p) { let mx = 0, my = 0; for (const q of p) { mx += q[0]; my += q[1]; } mx /= p.length; my /= p.length; for (const q of p) { q[0] -= mx; q[1] -= my; } return p; }
+// a collagen strand: cylinder of diameter w, refractive excess dn, wide-angle scattering alpha (per unit optical path)
+function emitStrand(A, pts, step, w0, alpha, kdn, dz0, dz1, rng) {
+  const n = pts.length - 1; if (n < 2) return;
+  const p1 = rng() * 6.28, p2 = rng() * 6.28, p3 = rng() * 6.28;
+  for (let i = 0; i <= n; i++) {
+    const u = i / n, s = i * step;
+    const taper = smooth(0, 0.08, u) * (1 - smooth(0.92, 1, u));
+    const w = Math.max(0.003, w0 * (0.75 + 0.25 * Math.sin(s * 9 + p1) + 0.18 * Math.sin(s * 23 + p2)) * (0.3 + 0.7 * taper));
+    const dz = lerp(dz0, dz1, u) + 0.08 * Math.sin(u * 5 + p3);
+    addBlob(at(A, pts[i][0], pts[i][1], dz), w / 2.355, alpha * 1.064 * w * step * (0.4 + 0.6 * taper), kdn * Math.PI * w * w / 4 * step);
+  }
+}
+function addFiberBundle(rng, A, o) {
+  const step = spacingFor(A.d), kdn = EYE.k * o.dn;
+  const cl = centerCurve(wanderCurve(rng, o.len, step, o.kSig, 0.35, rng() * 6.28)), n = cl.length - 1;
+  const tilt = 0.5 * gauss(rng);
+  for (let s = 0; s < o.strands; s++) {
+    const off0 = (s - (o.strands - 1) / 2) * o.spread * (0.6 + 0.8 * rng());
+    const wobA = o.spread * (0.3 + 0.5 * rng()), wobL = 0.35 + 0.9 * rng(), wobP = rng() * 6.28;
+    const i0 = o.strands > 1 ? Math.floor(rng() * 0.2 * n) : 0, i1 = n - (o.strands > 1 ? Math.floor(rng() * 0.2 * n) : 0);
+    const pts = [];
+    for (let i = i0; i <= i1; i++) {
+      const [x, y, th] = cl[i], sArc = i * step;
+      const off = off0 * (0.35 + 0.65 * sq(Math.sin(sArc * 1.7 + wobP))) + wobA * Math.sin(2 * Math.PI * sArc / wobL + wobP);
+      pts.push([x - Math.sin(th) * off, y + Math.cos(th) * off]);
+    }
+    emitStrand(A, pts, step, o.w0 * (0.55 + 0.9 * rng()), o.alpha, kdn, -tilt * 0.4, tilt * 0.4, rng);
+  }
+  for (let b = 0; b < o.branches; b++) {
+    const i = Math.floor((0.2 + 0.6 * rng()) * n), [x, y, th] = cl[i];
+    const br = wanderCurve(rng, o.len * (0.25 + 0.3 * rng()), step, o.kSig * 1.3, 0.3, th + (rng() < 0.5 ? -1 : 1) * (0.4 + 0.6 * rng()), x, y);
+    emitStrand(A, br, step, o.w0 * 0.6, o.alpha, kdn, 0, 0.3 * gauss(rng), rng);
+  }
+}
+function addBeadChain(rng, A, o) {   // cells strung along a fibre: "muscae volitantes"
+  const cl = centerCurve(wanderCurve(rng, o.len, 0.004, o.kSig, 0.4, rng() * 6.28)), kdn = EYE.k * o.dn, ph = rng() * 6.28;
+  let next = 0;
+  for (let i = 0; i < cl.length; i++) {
+    const s = i * 0.004; if (s < next) continue;
+    const a = o.a0 * (0.65 + 0.7 * rng());
+    addBlob(at(A, cl[i][0], cl[i][1], 0.1 * Math.sin(s * 3 + ph)), a / 1.6, o.alpha * Math.PI * a * a, kdn * 4 / 3 * Math.PI * a * a * a);
+    next = s + a * (2.1 + 1.6 * rng());
+  }
+}
+function addDot(rng, A, a, dn, alpha) { addBlob(A.P, a / 1.6, alpha * Math.PI * a * a, EYE.k * dn * 4 / 3 * Math.PI * a * a * a); }
+function addWeissRing(rng, A, o) {   // glial ring torn from the optic-disc margin when the vitreous detaches
+  const step = Math.min(spacingFor(A.d), 0.025), n = Math.ceil(2 * Math.PI * o.R / step), kdn = EYE.k * o.dn;
+  const ph = [0, 0, 0, 0, 0].map(() => rng() * 6.28), gap = rng() * 6.28, knot = gap + Math.PI * (0.7 + 0.6 * rng());
+  const ang = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+  for (let i = 0; i < n; i++) {
+    const th = 2 * Math.PI * i / n;
+    const rr = o.R * (1 + 0.13 * Math.sin(2 * th + ph[0]) + 0.07 * Math.sin(3 * th + ph[1]) + 0.04 * Math.sin(5 * th + ph[2]));
+    const open = smooth(0.25, 0.75, ang(th, gap)), kn = Math.exp(-sq(ang(th, knot) / 0.25));
+    const w = o.w * (0.75 + 0.35 * Math.sin(4 * th + ph[3])) * (0.25 + 0.75 * open) * (1 + 0.8 * kn);
+    addBlob(at(A, rr * Math.cos(th), 0.92 * rr * Math.sin(th), 0.18 * Math.sin(th + ph[4])), w / 2.355,
+      o.alpha * 1.064 * w * step * (0.15 + 0.85 * open) * (1 + 0.7 * kn), kdn * Math.PI * w * w / 4 * step);
+  }
+  const th = knot + 0.3;
+  emitStrand(A, wanderCurve(rng, o.R * 1.1, step, 1.6, 0.35, th, o.R * Math.cos(th), 0.92 * o.R * Math.sin(th)), step, o.w * 0.3, o.alpha * 0.8, kdn, 0.1, 0.4, rng);
+}
+function addCloud(rng, A, o) {       // faint sheet of condensed vitreous far from the retina
+  for (let i = 0; i < o.n; i++) {
+    const s = 0.08 + 0.16 * rng();
+    addBlob(at(A, gauss(rng) * o.ext, gauss(rng) * o.ext * 0.6, gauss(rng) * 0.35), s, o.alpha * 2 * Math.PI * s * s * (0.4 + rng()), EYE.k * 0.002 * 2 * s * Math.PI * s * s);
+  }
+}
+let SEED = 11;
+function makeEye(seed) {
+  const rng = mulberry32(seed), R = (a, b) => lerp(a, b, rng());
+  B.n = 0; FL = [];
+  // Floaters fill the whole eye: anywhere in the visual field (area-uniform out to 52°), at every depth
+  const where = maxE => { const e = maxE * Math.sqrt(rng()), a = rng() * 2 * Math.PI; return [e * Math.cos(a), e * Math.sin(a)]; };
+  const depth = () => { const u = rng(); return u < 0.55 ? R(0.3, 2.5) : u < 0.85 ? R(2.5, 6) : R(6, 11); };
+  const fit = (v, d) => {   // keep it inside the gel: behind the lens, clear of the eye wall
+    for (let i = 0; i < 16; i++) {
+      const A = anchor(v[0], v[1], d);
+      if (len3(sub(A.P, EYE.Cv)) < EYE.Rv - 0.9 && A.P[2] < EYE.zLens - 0.9) return A;
+      d *= 0.8;
+    }
+    return anchor(v[0], v[1], 0.4);
+  };
+  // openFloater(kind, tether stiffness, drag time, buoyant rise speed, reach)
+  let f = openFloater('ring', 5.5, 0.35, 0.5, 3.5);
+  addWeissRing(rng, fit([R(-5, 1), R(-5, 0)], R(3.8, 4.8)), { R: R(0.75, 0.95), w: R(0.11, 0.15), alpha: R(0.8, 1.1), dn: 0.012 });
+  closeFloater(f);
+  for (let i = 0; i < 16; i++) {
+    const A = fit(where(52), depth()), far = smooth(3, 9, A.d);   // deep strands must be big to be seen at all
+    f = openFloater('fiber', R(10, 22), R(0.08, 0.16), R(0.18, 0.4), R(1.5, 3.0));
+    addFiberBundle(rng, A, { len: R(1.2, 3.4) * (1 + far), strands: 1 + Math.floor(rng() * 3.6), w0: R(0.02, 0.05) * (1 + 1.5 * far),
+      alpha: R(0.4, 0.9), dn: R(0.02, 0.05), spread: R(0.02, 0.06) * (1 + far), kSig: R(0.8, 2.2), branches: rng() < 0.5 ? 1 : 0 });
+    closeFloater(f);
+  }
+  for (let i = 0; i < 7; i++) {
+    f = openFloater('beads', 8, 0.2, R(0.4, 0.75), R(2.5, 4.0));
+    addBeadChain(rng, fit(where(45), R(0.4, 1.8)), { len: R(0.3, 0.7), a0: R(0.012, 0.022), dn: R(0.04, 0.06), alpha: 0.3, kSig: R(1, 3) });
+    closeFloater(f);
+  }
+  for (let i = 0; i < 36; i++) {
+    f = openFloater('dot', R(6, 14), R(0.15, 0.3), R(0.4, 0.8), R(2.5, 4.5));
+    addDot(rng, fit(where(52), R(0.3, 3)), R(0.01, 0.03), R(0.03, 0.06), R(0.2, 0.6));
+    closeFloater(f);
+  }
+  for (let i = 0; i < 3; i++) {
+    f = openFloater('cloud', 7, 0.25, 0.15, 1.5);
+    addCloud(rng, fit(where(40), R(5, 9)), { n: 40, ext: R(0.7, 1.1), alpha: 0.05 });
+    closeFloater(f);
+  }
+}
+function stepFloaters(h) {
+  for (const f of FL) for (let k = 0; k < 2; k++) {   // damped tether to the local gel
+    const acc = f.w * f.w * (chiAt(k, f.rc) - f.phi[k]) + (velAt(k, f.rc) - f.phiV[k]) / f.tau;
+    f.phiV[k] += acc * h; f.phi[k] += f.phiV[k] * h;
+  }
+}
+// Loose floaters drift upward through the watery (liquefied) vitreous: slightly lighter than the fluid, or lifted by
+// slow convection. The retinal image is inverted, so the rise is seen as a downward glide. Eye movements stir the
+// fluid and the gel's tethers pull the floaters back, so the glide starts over whenever the eye comes to rest.
+function driftFloaters(dt, upEye, travel) {
+  const stir = Math.exp(-5 * travel);
+  for (const f of FL) {
+    const along = f.e[0] * upEye[0] + f.e[1] * upEye[1] + f.e[2] * upEye[2];
+    const v = f.rise * clamp(1 - along / f.reach, 0, 1);   // slows as its tether tightens
+    for (let k = 0; k < 3; k++) {
+      f.e[k] = (f.e[k] + (upEye[k] * v - f.e[k] / 40) * dt) * stir;
+      f.conv[k] += -f.conv[k] * dt / 8 + 0.04 * Math.sqrt(2 * dt / 8) * gauss(noiseRng);
+    }
+  }
+}
+
+// ---------- shadow casting: each blob → a disk-blurred, phase-contrast splat on the retina ----------
+const INST = new Float32Array(MAXB * 8);
+function projectBlobs(v) {
+  const E = EYE.E, Cv = EYE.Cv, N = EYE.N, Rv = EYE.Rv, lim = Rv - 0.12, lam = EYE.lamMed, kk = EYE.k;
+  const oX = E[0] - Cv[0], oY = E[1] - Cv[1], oZ = E[2] - Cv[2], qc = oX * oX + oY * oY + oZ * oZ - Rv * Rv;
+  const w0 = VIT.wall[0], w1 = VIT.wall[1], SQPI = Math.sqrt(Math.PI);
+  let count = 0;
+  for (const f of FL) {
+    const sY = f.phi[0] - chiAt(0, f.rc), sP = f.phi[1] - chiAt(1, f.rc);
+    const ox = f.e[0] + f.conv[0], oy = f.e[1] + f.conv[1], oz = f.e[2] + f.conv[2];
+    for (let j = f.i0; j < f.i1; j++) {
+      let x = B.x[j] + ox - Cv[0], y = B.y[j] + oy - Cv[1], z = B.z[j] + oz - Cv[2];
+      const r = Math.sqrt(x * x + y * y + z * z);
+      const ay = chiAt(0, r) - w0 + sY, ap = chiAt(1, r) - w1 + sP;   // gel rotation relative to the eye wall
+      let c = Math.cos(ap), s = Math.sin(ap), t2 = y * c + z * s; z = -y * s + z * c; y = t2;
+      c = Math.cos(ay); s = Math.sin(ay); t2 = x * c + z * s; z = -x * s + z * c; x = t2;
+      const rr = Math.sqrt(x * x + y * y + z * z);
+      if (rr > lim) { const q = lim / rr; x *= q; y *= q; z *= q; }
+      x += Cv[0]; y += Cv[1]; z += Cv[2];
+      if (z > EYE.zLens) z = EYE.zLens;
+      B.cx[j] = x; B.cy[j] = y; B.cz[j] = z;
+      const dx = x - E[0], dy = y - E[1], dz = z - E[2];
+      const qa = dx * dx + dy * dy + dz * dz, qb = 2 * (oX * dx + oY * dy + oZ * dz);
+      const t = (-qb + Math.sqrt(qb * qb - 4 * qa * qc)) / (2 * qa);     // ray pupil → floater → retina
+      const Lpf = Math.sqrt(qa), d = (t - 1) * Lpf, M = t;               // d: floater–retina distance, M: shadow magnification
+      const hx = E[0] + dx * t, hy = E[1] + dy * t, hz = E[2] + dz * t;
+      const wx = N[0] - hx, wy = N[1] - hy, wz = N[2] - hz, wl = Math.sqrt(wx * wx + wy * wy + wz * wz);
+      const ecc = Math.acos(clamp(wz / wl, -1, 1)) / DEG, rxy = Math.hypot(wx, wy) || 1e-9;
+      const sx = v.cx + ecc * v.ppd * wx / rxy, sy = v.cy + ecc * v.ppd * wy / rxy;
+      const pxmm = v.ppd / (wl * DEG);
+      const bmm = 0.5 * v.pExit * d / Lpf;                                // penumbra radius: pupil disk projected through the floater
+      const sret = Math.sqrt(sq(B.sig[j] * M) + sq(0.45 * Math.sqrt(lam * d * M)));   // own size + Fresnel softening
+      const b = Math.max(bmm * pxmm, 0.02), sg = Math.max(sret * pxmm, 0.6), a = Math.SQRT2 * sg;
+      const rad = b + 3.3 * a + 1;
+      if (sx < -rad || sy < -rad || sx > v.w + rad || sy > v.h + rad) continue;
+      const be = b / a;
+      const Nn = 2 * Math.PI * (a * b / (2 * SQPI) * Math.exp(-be * be) + erf(be) * (a * a / 4 + b * b / 2));
+      const pm2 = pxmm * pxmm, o = count * 8;
+      INST[o] = sx; INST[o + 1] = sy; INST[o + 2] = rad; INST[o + 3] = b;
+      INST[o + 4] = a; INST[o + 5] = 1 / Nn;
+      INST[o + 6] = B.alpha[j] * M * M * pm2 * v.gain;                            // absorbed / wide-angle-scattered light
+      INST[o + 7] = (d * M / kk) * B.phase[j] * M * M * pm2 * pm2 * v.gain;        // transport-of-intensity phase term
+      count++;
+    }
+  }
+  return count;
+}
+
+// ---------- one simulation frame ----------
+let LIGHT = null;
+function lighting(t, area) {
+  const s = LID.s;
+  const ms = (1 + 1.4 * s + 1.6 * s * s) * (1 + 0.012 * HEART.pulse * (1 + 2 * s));   // squeeze thickens the lid; pulse adds blood
+  const sun = sunDirHead(t), shade = 1 - 0.35 * s * s;
+  const L = { Q: eyeMatrix(GAZE.yaw * DEG, GAZE.pitch * DEG), sun, sunTan: sun[1] / sun[2], s, ms, ym: -3.4 + 1.7 * s,
+    beta: 0.9 * Math.exp(-0.55 * (ms - 1)), shade, area, veil: [0, 0, 0] };
+  const v = SPEC.lutAt(ms * 2.4);                                                   // light through sclera & iris: no pupil, no floaters
+  L.veil = [v[0] * 0.05 * shade, v[1] * 0.05 * shade, v[2] * 0.05 * shade];
+  return L;
+}
+const SAMPLE_DIRS = [[0, 0], [12, 0], [-12, 0], [0, 10], [0, -10]].map(p => dirFromView(p[0], p[1]));
+function step(dt) {
+  stepLid(dt); stepHeart(dt);
+  const n = Math.max(1, Math.ceil(dt * 400)), h = dt / n;
+  let travel = 0;   // voluntary + reflex eye rotation this frame (rad): stirs the vitreous
+  for (let i = 0; i < n; i++) {
+    const t = SIM.t + h, s0 = GAZE.sacPos[0], s1 = GAZE.sacPos[1] + GAZE.bell;
+    planSaccade(t); advanceSaccade(t);
+    for (let k = 0; k < 2; k++) GAZE.drift[k] += -GAZE.drift[k] * h / 1.4 + 0.2 * Math.sqrt(2 * h / 1.4) * gauss(noiseRng);
+    GAZE.bell += (14 * smooth(0.45, 1, LID.s) - GAZE.bell) * (1 - Math.exp(-h / 0.16));   // Bell's phenomenon
+    travel += Math.hypot(GAZE.sacPos[0] - s0, GAZE.sacPos[1] + GAZE.bell - s1) * DEG;
+    const yaw = clamp(GAZE.sacPos[0] + GAZE.drift[0], -42, 42), pitch = clamp(GAZE.sacPos[1] + GAZE.drift[1] + GAZE.bell, -38, 36);
+    const wy = yaw * DEG, wp = pitch * DEG;
+    VIT.wallVel[0] = (wy - VIT.wall[0]) / h; VIT.wallVel[1] = (wp - VIT.wall[1]) / h;
+    VIT.wall[0] = wy; VIT.wall[1] = wp;
+    pdeStep(0, wy, VIT.wallVel[0], h); pdeStep(1, wp, VIT.wallVel[1], h);
+    stepFloaters(h);
+    GAZE.yaw = yaw; GAZE.pitch = pitch; SIM.t = t;
+  }
+  // pupil follows the lid luminance (red light drives it weakly)
+  const Lp = lighting(SIM.t, 1), yLid = lumOf(lidLight([0, 0, 1], Lp, 1));
+  const Lcd = 650 * 0.5 * yLid;
+  const target = clamp(5.8 - 3.3 * Math.tanh(0.45 * Math.log10(Math.max(Lcd, 0.01) / 2)), 2.0, 7.2);
+  PUPIL.drive += (target - PUPIL.drive) * (1 - Math.exp(-dt / 0.2));
+  PUPIL.d += (PUPIL.drive - PUPIL.d) * (1 - Math.exp(-dt / (PUPIL.drive < PUPIL.d ? 0.45 : 1.7)));
+  PUPIL.hip += -PUPIL.hip * dt / 1.8 + 0.06 * Math.sqrt(2 * dt / 1.8) * gauss(noiseRng);   // hippus
+  const pd = clamp(PUPIL.d + PUPIL.hip, 1.8, 7.5);
+  LIGHT = lighting(SIM.t, pupilArea(pd) / AREA_REF);
+  LIGHT.pd = pd; LIGHT.pExit = pd * 0.92; LIGHT.Lcd = Lcd;
+  // global light adaptation of the three cone classes
+  const m = [0, 0, 0];
+  for (const u of SAMPLE_DIRS) { const c = lidLight(u, LIGHT, LIGHT.area); m[0] += c[0] / 5; m[1] += c[1] / 5; m[2] += c[2] / 5; }
+  const kf = 1 - Math.exp(-dt / 0.12), ks = 1 - Math.exp(-dt / 6);
+  for (let c = 0; c < 3; c++) { ADAPT.fast[c] += (m[c] - ADAPT.fast[c]) * kf; ADAPT.slow[c] += (m[c] - ADAPT.slow[c]) * ks; }
+  LIGHT.mean = m;
+  const Qt = LIGHT.Q, U = UP_HEAD;   // 'up' (against gravity) in the eye frame = Qᵀ·up
+  driftFloaters(dt, [Qt[0] * U[0] + Qt[3] * U[1] + Qt[6] * U[2], Qt[1] * U[0] + Qt[4] * U[1] + Qt[7] * U[2], Qt[2] * U[0] + Qt[5] * U[1] + Qt[8] * U[2]], travel);
+}
+function adaptation() {
+  const A = [0, 1, 2].map(c => Math.pow(Math.max(ADAPT.fast[c], 1e-6), 0.35) * Math.pow(Math.max(ADAPT.slow[c], 1e-6), 0.65));
+  const YA = Math.max(lumOf(A), 1e-6), gl = Math.pow(YA, -0.72), Dc = 0.12;   // partial von Kries
+  return { A, gain: A.map(a => gl * Math.pow(YA / Math.max(a, 1e-6), Dc)) };
+}
+
+// ---------- WebGL2 pipeline ----------
+const view = document.getElementById('view');
+const gl = view.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, premultipliedAlpha: false, powerPreference: 'high-performance' });
+const GL_OK = !!gl && !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+const EXPOSURE = 0.8, FLOATER_GAIN = 1.0, LOCAL_ADAPT = 0.4, LOCAL_TAU = 4.0;
+
+const GLSL_COMMON = `
+float sq(float x){ return x * x; }
+float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y); }
+`;
+const VS_FULL = `#version 300 es
+void main(){ vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+
+// Each blob's shadow: a uniform pupil-shaped disk (radius b) softened by a Gaussian (a = √2σ),
+// normalised to unit area, plus its Laplacian for the transport-of-intensity (phase) term.
+const VS_BLOB = `#version 300 es
+layout(location = 0) in vec2 aCorner;
+layout(location = 1) in vec4 aA;
+layout(location = 2) in vec4 aB;
+uniform vec2 uRes;
+out vec2 vOff;
+flat out vec3 vP;
+flat out vec2 vK;
+void main(){
+  vOff = aCorner * aA.z;
+  vP = vec3(aA.w, aB.x, aB.y);
+  vK = aB.zw;
+  gl_Position = vec4((aA.xy + vOff) / uRes * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const FS_BLOB = `#version 300 es
+precision highp float;
+in vec2 vOff;
+flat in vec3 vP;
+flat in vec2 vK;
+out vec4 o;
+float sq(float x){ return x * x; }
+float erf_(float x){ float s = sign(x); x = abs(x); float t = 1.0 / (1.0 + 0.3275911 * x);
+  return s * (1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x)); }
+void main(){
+  float r = length(vOff), b = vP.x, a = vP.y, iN = vP.z, ia = 1.0 / a;
+  const float RSQPI = 0.5641896;
+  float P = 0.5 * (erf_((b - r) * ia) + erf_((b + r) * ia));
+  float g1 = exp(-sq((r - b) * ia)), g2 = exp(-sq((r + b) * ia));
+  float d2 = 2.0 * ia * ia * ia * RSQPI * ((r - b) * g1 - (r + b) * g2);
+  float d1r = r > 0.02 * a ? (g2 - g1) * ia * RSQPI / r : -4.0 * b * exp(-sq(b * ia)) * ia * ia * ia * RSQPI;
+  o = vec4(vK.x * P * iN, vK.y * (d2 + d1r) * iN, 0.0, 0.0);
+}`;
+
+// Retinal irradiance: sunlit eyelid → pupil → (floater shadows) → retina, in cone space (LMS)
+const FS_RETINA = `#version 300 es
+precision highp float;
+uniform vec2 uRes, uCenter;
+uniform float uPpd;
+uniform mat3 uQ;
+uniform vec3 uSun, uUp, uVeil;
+uniform float uSunTan, uS, uMs, uYm, uBeta, uShade, uArea, uFG, uLog0, uLogK;
+uniform vec3 uLut[64];
+uniform sampler2D uShadow;
+out vec4 o;
+${GLSL_COMMON}
+vec3 lut(float m){ float f = clamp((log(m) - uLog0) * uLogK, 0.0, 62.999); int i = int(f); return mix(uLut[i], uLut[i + 1], f - float(i)); }
+float lidThick(vec2 p){
+  float t = 1.0;
+  t += 0.85 * exp(-sq((p.y - uYm) / 1.35));
+  t += 0.55 * smoothstep(5.0, 9.5, p.y);
+  t += 0.30 * (1.0 - smoothstep(uYm - 6.5, uYm - 1.5, p.y));
+  t += 0.45 * smoothstep(7.0, 12.0, abs(p.x + 0.8));
+  float f = exp(-sq((p.y - 3.1 - 0.4 * sin(p.x * 0.35 + 1.0)) / 0.75))
+          + 0.8 * exp(-sq((p.y - 6.0 - 0.5 * sin(p.x * 0.27 - 0.6)) / 0.85))
+          + 0.7 * exp(-sq((p.y - uYm + 2.3 - 0.3 * sin(p.x * 0.4)) / 0.65));
+  t += uS * uS * 0.75 * f;
+  // capillaries and skin texture of the lid, already blurred by the pupil aperture
+  return t * (1.0 + 0.05 * (vnoise(p * 0.55 + 3.1) - 0.5) + 0.03 * (vnoise(p * 1.4 + 9.7) - 0.5));
+}
+void main(){
+  vec2 v = (gl_FragCoord.xy - uCenter) / uPpd;
+  float lv = length(v), e = min(lv, 88.0) * 0.01745329;
+  vec2 dir = lv > 1e-5 ? v / lv : vec2(1.0, 0.0);
+  vec3 u = vec3(sin(e) * dir, cos(e));
+  vec3 uh = uQ * u, pe = uQ * vec3(0.0, 0.0, 10.5);
+  float bq = dot(pe, uh), cq = dot(pe, pe) - 14.2 * 14.2;
+  vec3 X = pe + uh * (-bq + sqrt(bq * bq - cq));
+  vec3 n = X / 14.2;
+  float brow = 1.0 - smoothstep(10.2, 13.0, X.y + (17.0 - X.z) * uSunTan);
+  float E = (0.84 * max(dot(n, uSun), 0.0) * brow + 0.16 * (0.55 + 0.45 * dot(n, uUp))) * uShade;
+  float F = 1.0 + uBeta * exp(2.2 * (dot(uh, uSun) - 1.0));
+  vec3 lms = lut(uMs * lidThick(X.xy)) * (E * F * uArea * (0.35 + 0.65 * u.z));
+  vec2 sh = texelFetch(uShadow, ivec2(gl_FragCoord.xy), 0).rg;
+  float T = exp(-sh.r * uFG) * exp(-clamp(sh.g * uFG, -0.6, 2.5));
+  float yb = dot(lms, vec3(0.62, 0.38, 0.0)), yv = dot(uVeil, vec3(0.62, 0.38, 0.0));
+  o = vec4(lms + uVeil, mix(1.0, T, yb / max(yb + yv, 1e-6)));   // rgb: glow, a: shadow transmission
+}`;
+
+// Local retinal adaptation map (slow, low resolution): causes fading of still shadows and afterimages
+const FS_ADAPT = `#version 300 es
+precision highp float;
+uniform sampler2D uRet, uPrev;
+uniform vec2 uRes, uTexel;
+uniform float uK;
+out vec4 o;
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 a = texture(uRet, uv + uTexel * vec2(-1.0, -1.0)), b = texture(uRet, uv + uTexel * vec2(1.0, -1.0));
+  vec4 c = texture(uRet, uv + uTexel * vec2(-1.0, 1.0)), d = texture(uRet, uv + uTexel * vec2(1.0, 1.0));
+  vec3 s = 0.25 * (a.rgb * a.a + b.rgb * b.a + c.rgb * c.a + d.rgb * d.a);
+  o = vec4(mix(texture(uPrev, uv).rgb, s, uK), 1.0);
+}`;
+
+// Perception: cone adaptation (global + local), noise, pressure phosphenes, gamut mapping, tone curve
+const FS_PERCEIVE = `#version 300 es
+precision highp float;
+uniform sampler2D uRet, uAdapt;
+uniform vec2 uRes, uCenter;
+uniform float uPpd, uDl, uExpo, uTime, uPhos, uPulse, uSpark, uShim, uSeed;
+uniform vec3 uGain, uAglob;
+uniform mat3 uL2R;
+out vec4 o;
+${GLSL_COMMON}
+float fbm(vec2 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ s += a * vnoise(p); p = p * 2.03 + 17.1; a *= 0.5; } return s; }
+uvec3 pcg3d(uvec3 v){ v = v * 1664525u + 1013904223u; v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+  v ^= v >> 16u; v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y; return v; }
+vec3 rnd3(ivec2 c, int k){ return vec3(pcg3d(uvec3(ivec3(c, k)))) * (1.0 / 4294967295.0); }
+// Photon and neural noise, pooled over receptive fields ~0.1–0.2° wide: sparse blurry specks that
+// twinkle for 0.1–0.3 s (and dart a little) at random places across the retina.
+float sparkle(vec2 v, float t){
+  const float CELL = 0.42;
+  ivec2 gi = ivec2(floor(v / CELL));
+  float s = 0.0;
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    ivec2 c = gi + ivec2(i, j);
+    vec3 h0 = rnd3(c, 0);
+    float ph = t / (0.10 + 0.22 * h0.y) + 10.0 * h0.x, kf = floor(ph), f = ph - kf;
+    vec3 h1 = rnd3(c, int(kf) + 1), h2 = rnd3(c + ivec2(7919, 1049), int(kf) + 1);
+    float env = sin(3.14159265 * f); env *= env;
+    vec2 p = (vec2(c) + h1.xy) * CELL + (h2.xy - 0.5) * 0.25 * f;
+    float sz = 0.06 + 0.10 * h2.z;
+    s += h1.z * h1.z * h1.z * env * exp(-dot(v - p, v - p) / (sz * sz));
+  }
+  return s;
+}
+float shimmer(vec2 p, float t){   // smooth fluctuation, ~70 ms correlation
+  float tt = t * 14.0, kf = floor(tt), f = smoothstep(0.0, 1.0, tt - kf);
+  ivec2 i = ivec2(floor(p)); vec2 w = fract(p); w = w * w * (3.0 - 2.0 * w);
+  vec2 n = vec2(0.0);
+  for (int z = 0; z < 2; z++) {
+    int k = int(kf) + z + 5;
+    n[z] = mix(mix(rnd3(i, k).x, rnd3(i + ivec2(1, 0), k).x, w.x), mix(rnd3(i + ivec2(0, 1), k).x, rnd3(i + ivec2(1, 1), k).x, w.x), w.y);
+  }
+  return mix(n.x, n.y, f) - 0.5;
+}
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 Rt = texture(uRet, uv);
+  vec3 Al = max(texture(uAdapt, uv).rgb, vec3(1e-5));
+  float lg = dot(pow(uAglob / Al, vec3(uDl)), vec3(0.62, 0.38, 0.0));   // local (spatial) adaptation
+  vec3 lms = Rt.rgb * uGain;
+  vec3 rgb = uL2R * lms;
+  float Y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+  float mn = min(rgb.r, min(rgb.g, rgb.b));
+  if (mn < 0.0) rgb = mix(vec3(Y), rgb, Y / max(Y - mn, 1e-6));
+  rgb = max(rgb, 0.0) * uExpo;
+  rgb = rgb * (1.0 + rgb / 16.0) / (1.0 + rgb);
+  // Local contrast (floater shadows, afterimages) is kept as Weber contrast: a local tone-mapping step,
+  // so the highlight compression above does not flatten shadows the eye would see clearly.
+  rgb = min(rgb * (Rt.a * lg), vec3(1.0));
+  vec2 vdeg = (gl_FragCoord.xy - uCenter) / uPpd;
+  float fl = uSpark * (sparkle(vdeg, uTime) - 0.029) + uShim * 2.0 * shimmer(vdeg / 0.13, uTime);
+  rgb = min(rgb * max(1.0 + fl, 0.0), vec3(1.0));
+  if (uPhos > 0.002) {
+    vec2 v = (gl_FragCoord.xy - uCenter) / uPpd;
+    float r = length(v);
+    vec2 q = v * 0.085;
+    float w1 = fbm(q + vec2(0.0, uTime * 0.11));
+    float w2 = fbm(q * 1.7 + vec2(w1 * 2.3, -uTime * 0.08) + 5.2);
+    float blot = smoothstep(0.48, 0.78, w2);
+    float ring = exp(-sq((r - 30.0 - 3.0 * sin(uTime * 0.7 + atan(v.y, v.x + 1e-4) * 3.0)) / 6.0));
+    vec3 col = mix(vec3(0.30, 0.34, 1.0), vec3(0.28, 0.95, 0.58), smoothstep(0.35, 0.65, w1));
+    vec3 ph = col * (blot * 0.6 + ring * 0.45) * uPhos * (0.8 + 0.2 * uPulse);
+    rgb = 1.0 - (1.0 - rgb) * (1.0 - 0.5 * ph);
+  }
+  vec3 c = mix(12.92 * rgb, 1.055 * pow(rgb, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, rgb));
+  c += (hash(gl_FragCoord.xy + uSeed * 311.0) - 0.5) / 255.0;
+  o = vec4(c, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) + '\n' + src.split('\n').slice(0, 4).join('\n'));
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i), name = info.name.replace(/\[0\]$/, ''); u[name] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+const R = { w: 0, h: 0, dpr: 1, ping: 0, adaptInit: false };
+function initGL() {
+  R.blob = program(VS_BLOB, FS_BLOB);
+  R.ret = program(VS_FULL, FS_RETINA);
+  R.adapt = program(VS_FULL, FS_ADAPT);
+  R.perc = program(VS_FULL, FS_PERCEIVE);
+  R.vaoEmpty = gl.createVertexArray();
+  R.vaoBlob = gl.createVertexArray(); gl.bindVertexArray(R.vaoBlob);
+  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  R.instBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, R.instBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, INST.byteLength, gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(1, 1);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(2, 1);
+  gl.bindVertexArray(null);
+}
+function makeTarget(w, h, filter) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('Float render target unsupported');
+  return { tex, fb };
+}
+function freeTarget(t) { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } }
+function resizeGL() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const w = Math.max(2, Math.round(innerWidth * dpr)), h = Math.max(2, Math.round(innerHeight * dpr));
+  if (w === R.w && h === R.h) return;
+  view.width = w; view.height = h; R.w = w; R.h = h; R.dpr = dpr;
+  [R.shadowT, R.retT, R.ad && R.ad[0], R.ad && R.ad[1]].forEach(freeTarget);
+  R.shadowT = makeTarget(w, h, gl.NEAREST);
+  R.retT = makeTarget(w, h, gl.LINEAR);
+  R.adW = Math.max(1, Math.round(w / 4)); R.adH = Math.max(1, Math.round(h / 4));
+  R.ad = [makeTarget(R.adW, R.adH, gl.LINEAR), makeTarget(R.adW, R.adH, gl.LINEAR)];
+  R.adaptInit = false;
+}
+function screenGeom() { return { cx: R.w / 2, cy: R.h / 2, ppd: Math.min(R.w, R.h) / 56, w: R.w, h: R.h }; }
+function render(dt) {
+  const L = LIGHT, ad = adaptation(), g = screenGeom();
+  const count = projectBlobs({ ...g, pExit: L.pExit, gain: 1 });
+  R.count = count;
+  if (!R.adaptInit) {   // start the local adaptation map at the global adaptation state
+    for (const t of R.ad) { gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb); gl.clearColor(ad.A[0], ad.A[1], ad.A[2], 1); gl.clear(gl.COLOR_BUFFER_BIT); }
+    R.adaptInit = true;
+  }
+  // 1 · floater shadows (additive splats)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, R.shadowT.fb); gl.viewport(0, 0, R.w, R.h);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  if (count > 0) {
+    gl.enable(gl.BLEND); gl.blendEquation(gl.FUNC_ADD); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(R.blob.p); gl.uniform2f(R.blob.u.uRes, R.w, R.h);
+    gl.bindVertexArray(R.vaoBlob);
+    gl.bindBuffer(gl.ARRAY_BUFFER, R.instBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, INST, 0, count * 8);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    gl.disable(gl.BLEND);
+  }
+  gl.bindVertexArray(R.vaoEmpty);
+  // 2 · retinal irradiance
+  gl.bindFramebuffer(gl.FRAMEBUFFER, R.retT.fb);
+  let u = R.ret.u; gl.useProgram(R.ret.p);
+  gl.uniform2f(u.uRes, R.w, R.h); gl.uniform2f(u.uCenter, g.cx, g.cy); gl.uniform1f(u.uPpd, g.ppd);
+  gl.uniformMatrix3fv(u.uQ, false, colMajor(L.Q));
+  gl.uniform3fv(u.uSun, L.sun); gl.uniform3fv(u.uUp, UP_HEAD); gl.uniform3fv(u.uVeil, L.veil);
+  gl.uniform1f(u.uSunTan, L.sunTan); gl.uniform1f(u.uS, L.s); gl.uniform1f(u.uMs, L.ms); gl.uniform1f(u.uYm, L.ym);
+  gl.uniform1f(u.uBeta, L.beta); gl.uniform1f(u.uShade, L.shade); gl.uniform1f(u.uArea, L.area); gl.uniform1f(u.uFG, FLOATER_GAIN);
+  gl.uniform1f(u.uLog0, SPEC.log0); gl.uniform1f(u.uLogK, SPEC.logK); gl.uniform3fv(u.uLut, SPEC.lut);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, R.shadowT.tex); gl.uniform1i(u.uShadow, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // 3 · local adaptation (ping-pong)
+  const src = R.ad[R.ping], dst = R.ad[1 - R.ping]; R.ping = 1 - R.ping;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb); gl.viewport(0, 0, R.adW, R.adH);
+  u = R.adapt.u; gl.useProgram(R.adapt.p);
+  gl.uniform2f(u.uRes, R.adW, R.adH); gl.uniform2f(u.uTexel, 1 / R.w, 1 / R.h); gl.uniform1f(u.uK, 1 - Math.exp(-dt / LOCAL_TAU));
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, R.retT.tex); gl.uniform1i(u.uRet, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.uniform1i(u.uPrev, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // 4 · perception → screen
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, R.w, R.h);
+  u = R.perc.u; gl.useProgram(R.perc.p);
+  gl.uniform2f(u.uRes, R.w, R.h); gl.uniform2f(u.uCenter, g.cx, g.cy); gl.uniform1f(u.uPpd, g.ppd);
+  gl.uniform3fv(u.uGain, ad.gain); gl.uniform3fv(u.uAglob, ad.A); gl.uniformMatrix3fv(u.uL2R, false, colMajor(LMS2RGB));
+  gl.uniform1f(u.uDl, LOCAL_ADAPT); gl.uniform1f(u.uExpo, EXPOSURE); gl.uniform1f(u.uTime, SIM.t);
+  gl.uniform1f(u.uPhos, 0.9 * smooth(0.62, 1, LID.s)); gl.uniform1f(u.uPulse, HEART.pulse);
+  const nf = (REDUCED ? 0.5 : 1) * Math.min(4, 1 / Math.sqrt(Math.max(lumOf(L.mean), 0.02)));   // shot noise ∝ 1/√photons
+  gl.uniform1f(u.uSpark, 0.16 * nf); gl.uniform1f(u.uShim, 0.014 * nf);
+  gl.uniform1f(u.uSeed, noiseRng());
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, R.retT.tex); gl.uniform1i(u.uRet, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, dst.tex); gl.uniform1i(u.uAdapt, 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+// the same perception chain on the CPU, for colouring the explainer
+function perceivedRGB(lms) {
+  const ad = adaptation();
+  const l = [lms[0] * ad.gain[0], lms[1] * ad.gain[1], lms[2] * ad.gain[2]];
+  let rgb = apply3(LMS2RGB, l);
+  const Y = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2], mn = Math.min(...rgb);
+  if (mn < 0) { const t = Y / Math.max(Y - mn, 1e-6); rgb = rgb.map(c => Y + (c - Y) * t); }
+  return rgb.map(c => { let x = Math.max(c, 0) * EXPOSURE; x = x * (1 + x / 16) / (1 + x); return Math.round(255 * clamp(x <= 0.0031308 ? 12.92 * x : 1.055 * Math.pow(x, 1 / 2.4) - 0.055, 0, 1)); });
+}
+
+// ---------- overlay: hint, lid gauge, explainer — all drawn on a 2D canvas ----------
+const ov = document.getElementById('overlay');
+const octx = ov.getContext('2d');
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const CSSV = getComputedStyle(document.documentElement), TOK = n => CSSV.getPropertyValue(n).trim();
+const INK = TOK('--ink') || '#ffece0', INK_DIM = TOK('--ink-dim') || 'rgba(255,230,212,0.66)';
+const LINE = TOK('--line') || 'rgba(255,214,190,0.45)', ACCENT = TOK('--accent') || '#ffb46e';
+const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif';
+const MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+const UI = { hintUntil: 11, hint: 0, diagram: false, diag: 0, gauge: 0, touch: matchMedia('(pointer: coarse)').matches, ow: 0, oh: 0, odpr: 1, drawn: false };
+const approach = (x, t, dt, tau) => x + (t - x) * (1 - Math.exp(-dt / tau));
+function resizeOverlay() {
+  const d = Math.min(window.devicePixelRatio || 1, 2), w = innerWidth, h = innerHeight;
+  if (w === UI.ow && h === UI.oh && d === UI.odpr) return;
+  UI.ow = w; UI.oh = h; UI.odpr = d; ov.width = Math.round(w * d); ov.height = Math.round(h * d); UI.drawn = true;
+}
+function drawOverlay(dt) {
+  resizeOverlay();
+  UI.hint = approach(UI.hint, SIM.t < UI.hintUntil ? 1 : 0, dt, 0.45);
+  UI.diag = approach(UI.diag, UI.diagram ? 1 : 0, dt, 0.18);
+  UI.gauge = approach(UI.gauge, SIM.t - LID.touchedAt < 1.6 ? 1 : 0, dt, 0.2);
+  const any = UI.hint > 0.004 || UI.diag > 0.004 || UI.gauge > 0.004;
+  if (!any && !UI.drawn) return;
+  const c = octx; c.setTransform(UI.odpr, 0, 0, UI.odpr, 0, 0); c.clearRect(0, 0, UI.ow, UI.oh);
+  UI.drawn = any;
+  if (UI.diag > 0.004) drawExplainer(c, UI.ow, UI.oh, UI.diag, dt);
+  if (UI.gauge > 0.004) drawGauge(c, UI.ow, UI.oh, UI.gauge);
+  if (UI.hint > 0.004) drawHint(c, UI.ow, UI.oh, UI.hint);
+}
+function wrapText(c, text, maxW) {
+  const out = []; let cur = '';
+  for (const w of text.split(' ')) { const t = cur ? cur + ' ' + w : w; if (cur && c.measureText(t).width > maxW) { out.push(cur); cur = w; } else cur = t; }
+  if (cur) out.push(cur); return out;
+}
+function drawHint(c, W, H, a) {
+  const parts = !UI.touch ? ['Move the pointer to move your eyes', 'Scroll to squeeze the lids', 'Hold the mouse button to squeeze hard']
+    : TILT.got ? ['Tilt the phone to move your eyes', 'Pinch to squeeze the lids', 'Press and hold to squeeze hard', 'Two-finger tap: recenter', 'Double-tap: how it works']
+    : ['Drag to move your eyes', 'Pinch to squeeze the lids', 'Press and hold to squeeze hard', 'Double-tap: how it works']
+        .concat(TILT.needsPermission && !TILT.asked ? ['Tap once to steer by tilting the phone'] : []);
+  c.save(); c.globalAlpha = a; c.textAlign = 'center'; c.textBaseline = 'alphabetic';
+  c.shadowColor = 'rgba(30, 4, 0, 0.65)'; c.shadowBlur = 14;
+  const fs = W < 520 ? 13 : 14.5, sep = '   ·   ';
+  c.font = `500 ${fs}px ${SANS}`;
+  let lines = [parts.join(sep)];
+  if (c.measureText(lines[0]).width > W - 40) lines = W < 620 ? parts : [parts.slice(0, 2).join(sep), parts.slice(2).join(sep)];
+  let keys = UI.touch ? '' : 'D  how it works     N  new floaters     1–5  lid pressure     H  help';
+  const lh = fs + 8;
+  let y = H - 36 - (keys ? 26 : 0) - (lines.length - 1) * lh;
+  const cx = W >= 860 && UI.diag > 0.3 ? (W - Math.min(500, Math.max(410, W * 0.38))) / 2 : W / 2;
+  c.fillStyle = INK;
+  for (const l of lines) { c.fillText(l, cx, y); y += lh; }
+  if (keys) {
+    c.font = `500 12px ${MONO}`; c.fillStyle = INK_DIM;
+    if (c.measureText(keys).width > W - 32) keys = 'D  explain   N  new   1–5  lids   H  help';
+    c.fillText(keys, cx, y + 8);
+  }
+  c.restore();
+}
+function drawGauge(c, W, H, a) {
+  const x = W - 26, y0 = H * 0.32, y1 = H * 0.68, h = y1 - y0;
+  c.save(); c.globalAlpha = a; c.shadowColor = 'rgba(30, 4, 0, 0.55)'; c.shadowBlur = 10; c.lineCap = 'round';
+  c.strokeStyle = LINE; c.lineWidth = 2; c.beginPath(); c.moveTo(x, y0); c.lineTo(x, y1); c.stroke();
+  c.strokeStyle = ACCENT; c.lineWidth = 4; c.beginPath(); c.moveTo(x, y1); c.lineTo(x, y1 - h * Math.max(LID.level, 0.005)); c.stroke();
+  c.fillStyle = INK; c.beginPath(); c.arc(x, y1 - h * LID.s, 3.5, 0, 2 * Math.PI); c.fill();
+  c.textAlign = 'right'; c.textBaseline = 'middle';
+  c.font = `600 12.5px ${SANS}`; c.fillText('Lid pressure', x - 14, y0);
+  c.font = `500 12px ${MONO}`; c.fillStyle = INK_DIM; c.fillText(Math.round(LID.level * 100) + '%', x - 14, y0 + 18);
+  c.restore();
+}
+function wlColor(l) {   // approximate display colour of a spectral line
+  let r = 0, g = 0, b = 0;
+  if (l < 440) { r = (440 - l) / 60; b = 1; } else if (l < 490) { g = (l - 440) / 50; b = 1; } else if (l < 510) { g = 1; b = (510 - l) / 20; }
+  else if (l < 580) { r = (l - 510) / 70; g = 1; } else if (l < 645) { r = 1; g = (645 - l) / 65; } else r = 1;
+  const f = l < 420 ? 0.3 + 0.7 * (l - 380) / 40 : l > 700 ? 0.3 + 0.7 * (780 - l) / 80 : 1;
+  return `rgb(${[r, g, b].map(v => Math.round(255 * Math.pow(v * f, 0.8))).join(',')})`;
+}
+const NOTES = [
+  { k: 'light', t: 'Light', s: 'About 1 mm of eyelid, skin and blood, absorbs blue and green. A bright, even, mostly red light fills the eye.' },
+  { k: 'shadow', t: 'Shadows', s: 'Floaters are clumps of collagen and cells in the vitreous gel, all through the eye. You see the shadows they cast on the retina.' },
+  { k: 'sharp', t: 'Sharpness', s: 'Blur ≈ pupil width × distance to the retina. Near ones look crisp, with bright cores. Deep ones are soft smudges.' },
+  { k: 'squeeze', t: 'Squeeze', s: 'A thicker lid lets through dimmer, redder light. The pupil widens, so shadows blur and fade. Hard squeezes roll the eyes up.' },
+  { k: 'move', t: 'Move', s: 'The gel lags each saccade, springs back and overshoots (≈1.6 Hz). Floaters swing, then settle.' },
+  { k: 'glide', t: 'Glide', s: 'Held still, loose floaters glide down. The retinal image is inverted, so they are really rising, lighter than the watery vitreous. Each eye movement stirs them back.' },
+  { k: 'sparkle', t: 'Sparkle', s: 'Photon and neural noise make the field shimmer with faint, blurry specks. It grows as the light dims.' },
+  { k: 'fade', t: 'Fading', s: 'A shadow that stops moving fades as the retina adapts to it. Move your eyes and it returns.' },
+];
+const noteScore = {};
+function noteTargets() {   // what is happening right now decides which notes get the room
+  const still = GAZE.sac ? 0 : SIM.t - GAZE.lastEnd, sq2 = LID.s > 0.3;
+  return { light: 10, shadow: 9, sharp: 5, squeeze: 3 + 8 * sq2, move: 3 + 8 * (still < 1.5 && GAZE.lastEnd > 0),
+    glide: 4 + 7 * (still > 1.2 && still < 14), sparkle: 3 + 5 * (LID.s > 0.5), fade: 2 + 6 * (still > 5) };
+}
+function drawExplainer(c, W, H, a, dt) {
+  const wide = W >= 860;
+  const pw = wide ? Math.min(500, Math.max(410, W * 0.38)) : W;
+  const ph = wide ? H : Math.min(H * 0.66, 660);
+  const x0 = wide ? W - pw : 0, y0 = wide ? 0 : H - ph;
+  c.save(); c.globalAlpha = a;
+  const gr = wide ? c.createLinearGradient(x0, 0, x0 + 70, 0) : c.createLinearGradient(0, y0, 0, y0 + 70);
+  gr.addColorStop(0, 'rgba(16, 5, 3, 0)'); gr.addColorStop(1, 'rgba(16, 5, 3, 0.9)');
+  c.fillStyle = gr; c.fillRect(x0, y0, pw, ph);
+  c.textBaseline = 'alphabetic'; c.textAlign = 'left';
+  if (wide) {
+    const x = x0 + 56, w = pw - 56 - 24;
+    let y = 40;
+    c.fillStyle = INK; c.font = `650 17px ${SANS}`; c.fillText('Why the floaters show up', x, y);
+    c.fillStyle = INK_DIM; c.font = `500 12px ${SANS}`; c.fillText('Right eye, horizontal section, seen from above', x, y + 19);
+    y += 32;
+    const dh = Math.min(w, H * 0.36);
+    drawEyeSection(c, x, y, w, dh);
+    y += dh + 10;
+    y = drawReadout(c, x, y, w);
+    drawNotes(c, x, y + 8, w, H - 104, dt);
+    drawSpectrum(c, x, H - 64, w, 34, a);
+  } else {
+    const x = 16, w = W - 32;
+    let y = y0 + 40;
+    c.fillStyle = INK; c.font = `650 16px ${SANS}`; c.fillText('Why the floaters show up', x, y);
+    y += 10;
+    const dS = Math.min(w * (W >= 620 ? 0.5 : 1), ph - (W >= 620 ? 70 : 150));
+    drawEyeSection(c, x, y, W >= 620 ? dS : w, dS);
+    if (W >= 620) {
+      const nx = x + dS + 18, nw = W - nx - 16;
+      const yy = drawReadout(c, nx, y + 6, nw);
+      drawNotes(c, nx, yy + 6, nw, H - 70, dt);
+      drawSpectrum(c, nx, H - 40, nw, 24, a);
+    } else {
+      drawReadout(c, x, y + dS + 8, w);
+    }
+  }
+  c.restore();
+}
+function drawReadout(c, x, y, w) {
+  const L = LIGHT, f = v => (v < 1 ? v.toFixed(2) : v.toFixed(1));
+  const lagY = (chiAt(0, 2) - VIT.wall[0]) / DEG, lagP = (chiAt(1, 2) - VIT.wall[1]) / DEG;
+  const rows = [
+    ['Pupil', `${L.pd.toFixed(1)} mm`],
+    ['Lid transmits', `${f(SPEC.transAt(650, L.ms) * 100)}% red · ${f(SPEC.transAt(550, L.ms) * 100)}% green · ${f(SPEC.transAt(450, L.ms) * 100)}% blue`],
+    ['Gaze', `${Math.abs(GAZE.yaw).toFixed(0)}° ${GAZE.yaw >= 0 ? 'right' : 'left'} · ${Math.abs(GAZE.pitch).toFixed(0)}° ${GAZE.pitch >= 0 ? 'up' : 'down'}`],
+    ['Gel core lag', `${Math.hypot(lagY, lagP).toFixed(1)}°`],
+  ];
+  const lw = w < 300 ? 92 : 104;
+  for (const [k, v] of rows) {
+    y += 17;
+    c.font = `500 11.5px ${SANS}`; c.fillStyle = INK_DIM; c.fillText(k, x, y);
+    c.font = `500 11.5px ${MONO}`; c.fillStyle = INK;
+    let s = v; while (s.length > 4 && c.measureText(s).width > w - lw) s = s.slice(0, -2);
+    c.fillText(s, x + lw, y);
+  }
+  return y + 4;
+}
+function drawNotes(c, x, y, w, yMax, dt) {
+  const tg = noteTargets();
+  for (const n of NOTES) noteScore[n.k] = approach(noteScore[n.k] ?? tg[n.k], tg[n.k], dt, 0.8);
+  c.font = `500 12.5px ${SANS}`;
+  const items = NOTES.map(n => ({ n, lines: wrapText(c, n.s, w) }));
+  const chosen = new Set(); let room = yMax - y;
+  for (const it of [...items].sort((p, q) => noteScore[q.n.k] - noteScore[p.n.k])) {
+    const h = 16 + it.lines.length * 17 + 6;
+    if (h <= room) { chosen.add(it.n.k); room -= h; }
+  }
+  for (const it of items) {   // shown in a fixed order, so the list never reshuffles
+    if (!chosen.has(it.n.k)) continue;
+    y += 16; c.font = `700 10.5px ${SANS}`; c.fillStyle = tg[it.n.k] >= 9 ? ACCENT : 'rgba(255, 180, 110, 0.62)';
+    c.fillText(it.n.t.toUpperCase(), x, y);
+    c.font = `500 12.5px ${SANS}`; c.fillStyle = INK;
+    for (const l of it.lines) { y += 17; c.fillText(l, x, y); }
+    y += 6;
+  }
+  return y;
+}
+function drawSpectrum(c, x, y, w, h, a) {
+  const sp = SPEC.spectrum(LIGHT.ms), wl = SPEC.wl, mx = Math.max(...sp), X = l => x + (l - 400) / 330 * w;
+  c.font = `500 11px ${SANS}`; c.fillStyle = INK_DIM; c.fillText('Spectrum reaching the retina', x, y - 6);
+  for (let i = 0; i < wl.length - 1; i++) {
+    const v = sp[i] / mx; c.globalAlpha = a * 0.92; c.fillStyle = wlColor(wl[i]);
+    c.fillRect(X(wl[i]), y + h - v * h, X(wl[i + 1]) - X(wl[i]) + 0.6, v * h);
+  }
+  c.globalAlpha = a; c.strokeStyle = LINE; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(x, y + h + 0.5); c.lineTo(x + w, y + h + 0.5); c.stroke();
+  c.font = `500 10.5px ${MONO}`; c.fillStyle = INK_DIM; c.textAlign = 'center';
+  for (const l of [450, 550, 650]) c.fillText(l + (l === 650 ? ' nm' : ''), X(l), y + h + 13);
+  c.textAlign = 'left';
+}
+function drawEyeSection(c, bx, by, bw, bh) {
+  const S = Math.min(bw, bh), k = S / 34, L = LIGHT;
+  const ox = bx + bw / 2, oy = by + S * 0.585;
+  const yaw = GAZE.yaw * DEG, cyw = Math.cos(yaw), syw = Math.sin(yaw);
+  const P = (x, z) => [ox + x * k, oy - z * k];                      // head frame (top view) → canvas
+  const PE = (x, z) => P(x * cyw + z * syw, -x * syw + z * cyw);    // eye frame → canvas
+  const Cv = EYE.Cv;
+  const poly = (pts, close) => { c.beginPath(); pts.forEach((p, i) => (i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1]))); if (close) c.closePath(); };
+  const text = (s, p, align = 'left', col = INK_DIM) => {
+    const w = c.measureText(s).width, x = align === 'right' ? p[0] - w : align === 'center' ? p[0] - w / 2 : p[0];
+    c.fillStyle = 'rgba(16, 5, 3, 0.62)'; c.fillRect(x - 3, p[1] - 10, w + 6, 14);
+    c.textAlign = 'left'; c.fillStyle = col; c.fillText(s, x, p[1]);
+  };
+  c.save(); c.lineJoin = 'round'; c.lineCap = 'round';
+  // sunlight
+  const s2 = nrm([L.sun[0], 0, L.sun[2]]);
+  c.strokeStyle = 'rgba(255, 200, 130, 0.6)'; c.lineWidth = 1.2;
+  for (let i = -3; i <= 3; i++) {
+    const ph = i * 12 * DEG, R0 = 14.4 + 0.8 * L.ms, lx = R0 * Math.sin(ph), lz = R0 * Math.cos(ph);
+    const a = P(lx + s2[0] * 3.2, lz + s2[2] * 3.2), b = P(lx, lz);
+    c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.stroke();
+  }
+  // closed eyelid (head-fixed), drawn in the colour it glows
+  const Ro = 14.3 + 0.8 * L.ms, Ri = 14.2, lid = [];
+  for (let i = 0; i <= 40; i++) { const ph = (-50 + 2.5 * i) * DEG; lid.push(P(Ro * Math.sin(ph), Ro * Math.cos(ph))); }
+  for (let i = 40; i >= 0; i--) { const ph = (-50 + 2.5 * i) * DEG; lid.push(P(Ri * Math.sin(ph), Ri * Math.cos(ph))); }
+  const glow = perceivedRGB(lidLight([0, 0, 1], L, L.area));
+  poly(lid, true); c.fillStyle = `rgb(${glow.join(',')})`; c.fill(); c.strokeStyle = 'rgba(255, 225, 205, 0.55)'; c.lineWidth = 1; c.stroke();
+  // globe
+  const cv = PE(Cv[0], Cv[2]);
+  c.strokeStyle = LINE; c.lineWidth = 1.2; c.beginPath(); c.arc(cv[0], cv[1], 12 * k, 0, 2 * Math.PI); c.stroke();
+  // light entering through the pupil
+  const pe = L.pExit / 2, cone = [PE(-pe, EYE.E[2])];
+  for (let i = 0; i <= 24; i++) { const t = (140 + 80 * i / 24) * DEG; cone.push(PE(Cv[0] + 11 * Math.sin(t), Cv[2] + 11 * Math.cos(t))); }
+  cone.push(PE(pe, EYE.E[2]));
+  poly(cone, true); c.fillStyle = 'rgba(255, 110, 50, 0.12)'; c.fill();
+  // material lines of the gel: they bend while the core lags behind the eye wall
+  c.strokeStyle = 'rgba(255, 205, 175, 0.22)'; c.lineWidth = 1;
+  for (let s = 0; s < 10; s++) {
+    const th0 = s * 36 * DEG, pts = [];
+    for (let r = 0.4; r <= 10.95; r += 0.5) {
+      const th = th0 + chiAt(0, r) - VIT.wall[0], x = Cv[0] + r * Math.sin(th), z = Cv[2] + r * Math.cos(th);
+      if (z > EYE.zLens) break;
+      pts.push(PE(x, z));
+    }
+    if (pts.length > 1) { poly(pts, false); c.stroke(); }
+  }
+  // lens, cornea, iris
+  const lens = []; for (let i = 0; i < 48; i++) { const t = i / 48 * 2 * Math.PI; lens.push(PE(4.3 * Math.cos(t), 8.0 + 1.9 * Math.sin(t))); }
+  poly(lens, true); c.fillStyle = 'rgba(255, 235, 215, 0.08)'; c.fill(); c.strokeStyle = LINE; c.stroke();
+  const cor = []; for (let i = -24; i <= 24; i++) { const t = i * 2 * DEG; cor.push(PE(7.8 * Math.sin(t), 5.7 + 7.8 * Math.cos(t))); }
+  poly(cor, false); c.strokeStyle = 'rgba(255, 235, 220, 0.75)'; c.lineWidth = 1.3; c.stroke();
+  c.strokeStyle = 'rgba(255, 228, 208, 0.95)'; c.lineWidth = 2.2;
+  for (const sg of [-1, 1]) { const p = PE(sg * L.pd / 2, 10.3), q = PE(sg * 5.9, 10.3); c.beginPath(); c.moveTo(p[0], p[1]); c.lineTo(q[0], q[1]); c.stroke(); }
+  // retina, fovea, optic nerve (nasal side)
+  const ret = []; for (let i = 0; i <= 64; i++) { const t = (100 + 160 * i / 64) * DEG; ret.push(PE(Cv[0] + 11 * Math.sin(t), Cv[2] + 11 * Math.cos(t))); }
+  poly(ret, false); c.strokeStyle = 'rgba(255, 125, 85, 0.9)'; c.lineWidth = 2.2; c.stroke();
+  const on = 195 * DEG, onw = 0.09, nerve = [];
+  for (const [r, dt] of [[11, -onw], [14, -onw * 0.8], [14, onw * 0.8], [11, onw]]) nerve.push(PE(Cv[0] + r * Math.sin(on + dt), Cv[2] + r * Math.cos(on + dt)));
+  poly(nerve, false); c.strokeStyle = LINE; c.lineWidth = 1.2; c.stroke();
+  // the Weiss ring's shadow cone: pupil edges → floater → retina
+  const f0 = FL[0];
+  if (f0 && f0.i1 > f0.i0) {
+    let mx = 0, mz = 0; for (let j = f0.i0; j < f0.i1; j++) { mx += B.cx[j]; mz += B.cz[j]; }
+    mx /= f0.i1 - f0.i0; mz /= f0.i1 - f0.i0;
+    const hits = [-1, 1].map(sg => {
+      const ex = sg * pe, ez = EYE.E[2], dx = mx - ex, dz = mz - ez, oxx = ex - Cv[0], ozz = ez - Cv[2];
+      const qa = dx * dx + dz * dz, qb = 2 * (oxx * dx + ozz * dz), qc = oxx * oxx + ozz * ozz - 121;
+      const t = (-qb + Math.sqrt(qb * qb - 4 * qa * qc)) / (2 * qa);
+      return { e: [ex, ez], h: [ex + dx * t, ez + dz * t] };
+    });
+    c.strokeStyle = 'rgba(255, 238, 225, 0.4)'; c.lineWidth = 1; c.setLineDash([3, 3]);
+    for (const hh of hits) { const p = PE(hh.e[0], hh.e[1]), q = PE(hh.h[0], hh.h[1]); c.beginPath(); c.moveTo(p[0], p[1]); c.lineTo(q[0], q[1]); c.stroke(); }
+    c.setLineDash([]);
+    poly([PE(mx, mz), PE(hits[0].h[0], hits[0].h[1]), PE(hits[1].h[0], hits[1].h[1])], true);
+    c.fillStyle = 'rgba(10, 2, 1, 0.38)'; c.fill();
+    const a0 = Math.atan2(hits[0].h[0] - Cv[0], hits[0].h[1] - Cv[2]), a1 = Math.atan2(hits[1].h[0] - Cv[0], hits[1].h[1] - Cv[2]);
+    const arc = []; for (let i = 0; i <= 12; i++) { const t = a0 + (Math.atan2(Math.sin(a1 - a0), Math.cos(a1 - a0))) * i / 12; arc.push(PE(Cv[0] + 11 * Math.sin(t), Cv[2] + 11 * Math.cos(t))); }
+    poly(arc, false); c.strokeStyle = 'rgba(12, 2, 1, 0.95)'; c.lineWidth = 4.5; c.stroke();
+    // blur of this shadow on the retina, in degrees of visual angle
+    const d = Math.hypot((hits[0].h[0] + hits[1].h[0]) / 2 - mx, (hits[0].h[1] + hits[1].h[1]) / 2 - mz);
+    const blur = 2 * (0.5 * L.pExit * d / Math.hypot(mx, mz - EYE.E[2])) / 16.7 / DEG;
+    c.font = `500 11px ${SANS}`;
+    const lp = PE((hits[0].h[0] + hits[1].h[0]) / 2, (hits[0].h[1] + hits[1].h[1]) / 2);
+    text(`shadow · blur ${blur.toFixed(1)}°`, [lp[0] + 10, lp[1] + 16]);
+    const rp = PE(mx, mz); text('Weiss ring', [rp[0] + 9, rp[1] - 6], 'left', INK);
+  }
+  // the floaters themselves (current positions, projected onto this section)
+  for (const f of FL) {
+    const alpha = f.kind === 'cloud' ? 0.14 : f.kind === 'ring' ? 0.95 : 0.75;
+    c.fillStyle = `rgba(255, 242, 230, ${alpha})`;
+    for (let j = f.i0; j < f.i1; j++) {
+      const p = PE(B.cx[j], B.cz[j]), s = Math.max(1.3, Math.min(4, 2.4 * B.sig[j] * k));
+      c.fillRect(p[0] - s / 2, p[1] - s / 2, s, s);
+    }
+  }
+  // labels
+  c.font = `500 11.5px ${SANS}`;
+  const sl = P(s2[0] * 19.5 + 0.8, s2[2] * 19.5); text('sunlight', sl, 'left', 'rgba(255, 210, 150, 0.9)');
+  text('closed eyelid', P(Ro * Math.sin(52 * DEG) + 0.6, Ro * Math.cos(52 * DEG) - 0.4));
+  text(`pupil ${L.pd.toFixed(1)} mm`, PE(-7.0, 10.2), 'right');
+  text('lens', PE(-4.9, 7.4), 'right');
+  text('vitreous gel', PE(-5.0, 0.8), 'center');
+  text('retina', PE(9.6, -9.6), 'left');
+  text('optic nerve', PE(-4.6, -12.6), 'right');
+  c.font = `500 10.5px ${SANS}`;
+  text('nasal', [ox - 16.8 * k, oy + 2], 'left', 'rgba(255, 230, 212, 0.4)');
+  text('temporal', [ox + 16.8 * k, oy + 2], 'right', 'rgba(255, 230, 212, 0.4)');
+  c.restore();
+}
+
+// ---------- device tilt: the phone's motion sensors steer the eyes ----------
+// Gravity in device axes is rebuilt from the orientation angles (browsers normalise those, unlike the signs of
+// raw accelerometer data), then measured against the screen's own right/up axes, so any screen rotation works.
+// Right edge down → look right; top edge raised → look up. Relative to the pose held when tilt was (re)centred.
+const TILT = { supported: typeof window.DeviceOrientationEvent !== 'undefined', needsPermission: false, asked: false,
+  on: false, got: false, denied: false, override: false, cmd: null, zero: null, f: [0, 0] };
+TILT.needsPermission = TILT.supported && typeof DeviceOrientationEvent.requestPermission === 'function';
+const TILT_GAIN = 1.4;
+function screenAngle() {
+  const a = screen.orientation && typeof screen.orientation.angle === 'number' ? screen.orientation.angle : typeof window.orientation === 'number' ? window.orientation : 0;
+  return (((Math.round(a / 90) * 90) % 360) + 360) % 360;
+}
+function tiltCommand(beta, gamma) {
+  const b = beta * DEG, g = gamma * DEG;
+  const down = [Math.sin(g) * Math.cos(b), -Math.sin(b), -Math.cos(b) * Math.cos(g)];   // gravity, device axes
+  const a = screenAngle();
+  const Rt = a === 90 ? [0, -1, 0] : a === 270 ? [0, 1, 0] : a === 180 ? [-1, 0, 0] : [1, 0, 0];   // screen right
+  const Up = a === 90 ? [1, 0, 0] : a === 270 ? [-1, 0, 0] : a === 180 ? [0, -1, 0] : [0, 1, 0];  // screen up
+  return [Math.asin(clamp(dot(down, Rt), -1, 1)) / DEG, -Math.atan2(down[2], dot(down, Up)) / DEG];
+}
+function recenterTilt(toCenter) {   // map the current pose to the current gaze target (or straight ahead)
+  if (!TILT.cmd) return;
+  if (toCenter) GAZE.target = [0, 0];
+  TILT.zero = [TILT.cmd[0] - GAZE.target[0] / TILT_GAIN, TILT.cmd[1] - GAZE.target[1] / TILT_GAIN];
+  TILT.f = GAZE.target.slice();
+}
+function onOrientation(e) {
+  if (e.beta == null || e.gamma == null) return;
+  TILT.cmd = tiltCommand(e.beta, e.gamma);
+  if (!TILT.got) { TILT.got = true; UI.hintUntil = Math.max(UI.hintUntil, SIM.t + 6); }
+  if (!TILT.zero) recenterTilt(false);
+}
+function startTilt() { if (!TILT.on) { window.addEventListener('deviceorientation', onOrientation); TILT.on = true; } }
+function requestTilt() {   // iOS only grants sensor access from inside a user gesture
+  if (!TILT.supported || TILT.on || TILT.asked || !UI.touch) return;
+  TILT.asked = true;
+  if (!TILT.needsPermission) { startTilt(); return; }
+  DeviceOrientationEvent.requestPermission().then(s => { if (s === 'granted') startTilt(); else TILT.denied = true; }).catch(() => { TILT.denied = true; });
+}
+function applyTilt(dt) {
+  GAZE.minAmp = TILT.got && !TILT.override ? 1.3 : 0.7;   // ignore hand tremor
+  if (!TILT.cmd || !TILT.zero || TILT.override) return;
+  const wrap = d => ((d + 540) % 360) - 180, k = 1 - Math.exp(-dt / 0.12);
+  const tx = clamp(wrap(TILT.cmd[0] - TILT.zero[0]) * TILT_GAIN, -38, 38), ty = clamp(wrap(TILT.cmd[1] - TILT.zero[1]) * TILT_GAIN, -30, 28);
+  TILT.f[0] += (tx - TILT.f[0]) * k; TILT.f[1] += (ty - TILT.f[1]) * k;
+  GAZE.target = [TILT.f[0], TILT.f[1]];
+}
+if (UI.touch && TILT.supported && !TILT.needsPermission) { TILT.asked = true; startTilt(); }   // Android: no prompt
+window.addEventListener('orientationchange', () => { TILT.zero = null; });
+if (screen.orientation && screen.orientation.addEventListener) screen.orientation.addEventListener('change', () => { TILT.zero = null; });
+window.addEventListener('touchend', requestTilt);
+
+// ---------- input ----------
+function setTargetFromPointer(px, py) {
+  const m = Math.min(innerWidth, innerHeight) / 2;
+  GAZE.target[0] = clamp((px - innerWidth / 2) / m * 30, -38, 38);
+  GAZE.target[1] = clamp(-(py - innerHeight / 2) / m * 30, -30, 28);
+}
+function setLevel(x) { LID.level = clamp(x, 0, 1); LID.touchedAt = SIM.t; }
+function toggleDiagram() { UI.diagram = !UI.diagram; view.classList.toggle('cursor', UI.diagram); }
+const touches = new Map(); let pinch = null, holdTimer = 0, lastTap = { t: 0, x: 0, y: 0 }, gest = null;
+view.addEventListener('pointerdown', e => {
+  view.focus({ preventScroll: true });
+  if (e.pointerType === 'mouse') { if (e.button === 0) LID.hold = 1; setTargetFromPointer(e.clientX, e.clientY); return; }
+  try { view.setPointerCapture(e.pointerId); } catch (_) { /* capture is optional */ }
+  touches.set(e.pointerId, { x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY });
+  if (touches.size === 1) gest = { t0: performance.now(), max: 1, moved: 0, l0: LID.level };
+  else if (gest) gest.max = Math.max(gest.max, touches.size);
+  TILT.override = true;   // a finger on the glass steers instead of the tilt
+  if (touches.size === 1) {
+    setTargetFromPointer(e.clientX, e.clientY);
+    clearTimeout(holdTimer); holdTimer = setTimeout(() => { if (touches.size === 1) LID.hold = 1; }, 420);
+    const now = performance.now();
+    if (now - lastTap.t < 320 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) { toggleDiagram(); lastTap.t = 0; }
+    else lastTap = { t: now, x: e.clientX, y: e.clientY };
+  } else if (touches.size === 2) {
+    clearTimeout(holdTimer); LID.hold = 0;
+    const [p, q] = [...touches.values()]; pinch = { d0: Math.hypot(p.x - q.x, p.y - q.y), l0: LID.level };
+  }
+});
+view.addEventListener('pointermove', e => {
+  if (e.pointerType === 'mouse') { setTargetFromPointer(e.clientX, e.clientY); return; }
+  const t = touches.get(e.pointerId); if (!t) return;
+  if (gest) gest.moved += Math.hypot(e.clientX - t.x, e.clientY - t.y);
+  t.x = e.clientX; t.y = e.clientY;
+  if (touches.size === 1) { if (Math.hypot(t.x - t.x0, t.y - t.y0) > 14) clearTimeout(holdTimer); setTargetFromPointer(t.x, t.y); }
+  else if (touches.size === 2 && pinch) {
+    const [p, q] = [...touches.values()];
+    setLevel(pinch.l0 + (pinch.d0 - Math.hypot(p.x - q.x, p.y - q.y)) / (Math.min(innerWidth, innerHeight) * 0.45));
+  }
+});
+function endPointer(e) {
+  if (e.pointerType === 'mouse') { if (e.button === 0) LID.hold = 0; return; }
+  if (!touches.delete(e.pointerId)) return;
+  clearTimeout(holdTimer); LID.hold = 0; if (touches.size < 2) pinch = null;
+  if (touches.size === 0) {
+    TILT.override = false;
+    if (gest && gest.max === 2 && performance.now() - gest.t0 < 350 && gest.moved < 24) { LID.level = gest.l0; recenterTilt(true); }
+    else recenterTilt(false);   // hand back to the tilt without a jump
+    gest = null;
+  }
+}
+window.addEventListener('pointerup', endPointer);
+window.addEventListener('pointercancel', endPointer);
+view.addEventListener('wheel', e => {
+  e.preventDefault();
+  setLevel(LID.level + e.deltaY * (e.deltaMode === 1 ? 0.03 : e.deltaMode === 2 ? 0.3 : 0.0011));
+}, { passive: false });
+view.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('keydown', e => {
+  const k = e.key;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (k === ' ') { LID.hold = 1; e.preventDefault(); }
+  else if (k === 'd' || k === 'D') toggleDiagram();
+  else if (k === 'h' || k === 'H' || k === '?') UI.hintUntil = SIM.t + 8;
+  else if (k === 'n' || k === 'N') { SEED = (SEED * 48271 + 7) % 2147483647; makeEye(SEED); }
+  else if (k >= '1' && k <= '5') setLevel([0.04, 0.3, 0.55, 0.78, 1][+k - 1]);
+  else if (k === '+' || k === '=') setLevel(LID.level + 0.1);
+  else if (k === '-' || k === '_') setLevel(LID.level - 0.1);
+  else if (k === '0' || k === 'c' || k === 'C') GAZE.target = [0, 0];
+  else if (k.startsWith('Arrow')) {
+    e.preventDefault();
+    const d = { ArrowLeft: [-8, 0], ArrowRight: [8, 0], ArrowUp: [0, 8], ArrowDown: [0, -8] }[k];
+    if (d) GAZE.target = [clamp(GAZE.target[0] + d[0], -38, 38), clamp(GAZE.target[1] + d[1], -30, 28)];
+  }
+});
+window.addEventListener('keyup', e => { if (e.key === ' ') LID.hold = 0; });
+window.addEventListener('blur', () => { LID.hold = 0; });
+
+// ---------- boot ----------
+function fatal(msg) {
+  resizeOverlay();
+  const c = octx; c.setTransform(UI.odpr, 0, 0, UI.odpr, 0, 0);
+  c.fillStyle = '#140503'; c.fillRect(0, 0, UI.ow, UI.oh);
+  c.fillStyle = INK; c.textAlign = 'center'; c.font = `500 15px ${SANS}`;
+  const lines = wrapText(c, msg, Math.min(UI.ow - 40, 520));
+  lines.forEach((l, i) => c.fillText(l, UI.ow / 2, UI.oh / 2 + (i - (lines.length - 1) / 2) * 22));
+}
+let lastT = 0, running = false;
+function frame(now) {
+  if (!running) return;
+  const dt = lastT ? clamp((now - lastT) / 1000, 0.0005, 0.05) : 1 / 60; lastT = now;
+  try { resizeGL(); applyTilt(dt); step(dt); render(dt); }
+  catch (err) { console.error(err); running = false; fatal('The simulation stopped: ' + err.message); return; }
+  drawOverlay(dt);
+  requestAnimationFrame(frame);
+}
+document.addEventListener('visibilitychange', () => { lastT = 0; });
+view.addEventListener('webglcontextlost', e => { e.preventDefault(); running = false; fatal('The graphics context was lost. Reload the page to restart the simulation.'); });
+if (!GL_OK) fatal('This simulation needs WebGL 2 with floating-point render targets, which this browser or device does not provide.');
+else {
+  try { initGL(); makeEye(SEED); resizeGL(); step(1 / 60); running = true; requestAnimationFrame(frame); }
+  catch (err) { console.error(err); fatal('WebGL could not start: ' + err.message); }
+}
+</script>
+</body>
 </html>
