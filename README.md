@@ -164,3 +164,7 @@ Then visit <http://localhost:8000>. Tilt steering on a phone needs HTTPS. The [l
 
 - [Direction of Floater Movement](https://groups.google.com/g/sci.med.vision/c/vgdBjtbBF2E), sci.med.vision
 - [In-depth observations on eye floaters: a challenge to ophthalmology](https://www.sensitiveskinmagazine.com/in-depth-observations-on-eye-floaters-a-challenge-to-ophthalmology/), Sensitive Skin Magazine
+
+## License
+
+[MIT](LICENSE) © 2026 Uwe Dauernheim
